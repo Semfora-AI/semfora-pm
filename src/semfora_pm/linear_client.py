@@ -516,18 +516,30 @@ class LinearClient:
         result = self._request(mutation, {"id": issue_id, "input": input_data})
         return result["issueUpdate"]["issue"]
 
-    def search_issues(self, query: str) -> list[dict]:
-        """Search for issues."""
+    def search_issues(self, query: str, team_id: Optional[str] = None, limit: int = 50) -> list[dict]:
+        """Search for issues by title (contains match).
+
+        Args:
+            query: Search string to match in title
+            team_id: Optional team ID to filter results
+            limit: Maximum results to return
+
+        Returns:
+            List of matching issues with basic info
+        """
         gql = """
-        query($filter: IssueFilter) {
-            issues(filter: $filter) {
+        query($filter: IssueFilter, $first: Int) {
+            issues(filter: $filter, first: $first) {
                 nodes {
                     id
                     identifier
                     title
                     url
+                    priority
+                    estimate
                     state {
                         name
+                        type
                     }
                     labels {
                         nodes {
@@ -538,12 +550,41 @@ class LinearClient:
             }
         }
         """
-        result = self._request(gql, {
-            "filter": {
-                "title": {"contains": query}
-            }
-        })
+        filter_obj: dict = {"title": {"containsIgnoreCase": query}}
+        if team_id:
+            filter_obj["team"] = {"id": {"eq": team_id}}
+
+        result = self._request(gql, {"filter": filter_obj, "first": limit})
         return result["issues"]["nodes"]
+
+    def search_issues_multi(self, queries: list[str], team_id: Optional[str] = None) -> list[dict]:
+        """Search for issues matching any of multiple queries.
+
+        Useful for duplicate detection - searches for each title and dedupes results.
+
+        Args:
+            queries: List of search strings (typically ticket titles)
+            team_id: Optional team ID to filter results
+
+        Returns:
+            Deduplicated list of matching issues
+        """
+        seen_ids: set[str] = set()
+        results: list[dict] = []
+
+        for query in queries:
+            # Extract key words (skip very short words)
+            words = [w for w in query.split() if len(w) > 3]
+            # Search with first few significant words
+            search_term = " ".join(words[:4]) if words else query[:30]
+
+            matches = self.search_issues(search_term, team_id, limit=20)
+            for issue in matches:
+                if issue["id"] not in seen_ids:
+                    seen_ids.add(issue["id"])
+                    results.append(issue)
+
+        return results
 
     def get_issue_by_identifier(self, identifier: str) -> Optional[dict]:
         """Get issue by its identifier (e.g., 'SEM-123')."""
@@ -565,6 +606,115 @@ class LinearClient:
                     nodes {
                         id
                         name
+                    }
+                }
+            }
+        }
+        """
+        try:
+            result = self._request(query, {"id": identifier})
+            return result.get("issue")
+        except Exception:
+            return None
+
+    def get_issue_full(self, identifier: str) -> Optional[dict]:
+        """Get full issue details by identifier (e.g., 'SEM-123').
+
+        Returns all available data including assignee, project, cycle,
+        relations, sub-issues, dates, and more.
+        """
+        query = """
+        query($id: String!) {
+            issue(id: $id) {
+                id
+                identifier
+                title
+                description
+                url
+                priority
+                estimate
+                createdAt
+                updatedAt
+                startedAt
+                completedAt
+                canceledAt
+                dueDate
+                state {
+                    id
+                    name
+                    type
+                    color
+                }
+                assignee {
+                    id
+                    name
+                    email
+                    avatarUrl
+                }
+                creator {
+                    id
+                    name
+                }
+                labels {
+                    nodes {
+                        id
+                        name
+                        color
+                    }
+                }
+                project {
+                    id
+                    name
+                    state
+                }
+                cycle {
+                    id
+                    name
+                    number
+                    startsAt
+                    endsAt
+                }
+                parent {
+                    id
+                    identifier
+                    title
+                }
+                children {
+                    nodes {
+                        id
+                        identifier
+                        title
+                        state {
+                            name
+                        }
+                    }
+                }
+                relations {
+                    nodes {
+                        id
+                        type
+                        relatedIssue {
+                            id
+                            identifier
+                            title
+                        }
+                    }
+                }
+                comments {
+                    nodes {
+                        id
+                        body
+                        createdAt
+                        user {
+                            name
+                        }
+                    }
+                }
+                attachments {
+                    nodes {
+                        id
+                        title
+                        url
                     }
                 }
             }
