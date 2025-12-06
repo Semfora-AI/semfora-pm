@@ -8,8 +8,15 @@ from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from typing import Optional
 
-from .linear_client import LinearClient, LinearConfig
+from .linear_client import LinearClient, LinearConfig, AuthenticationError
 from .models.ticket import Ticket, load_tickets, save_tickets, Component
+from .pm_config import (
+    resolve_context,
+    create_pm_config,
+    scan_pm_directories,
+    get_context_help_message,
+    PMContext,
+)
 
 app = typer.Typer(
     name="semfora-pm",
@@ -21,14 +28,180 @@ console = Console()
 TICKETS_DIR = Path(__file__).parent.parent.parent.parent / "tickets"
 
 
-def get_client() -> LinearClient:
-    """Get configured Linear client or exit with error."""
-    config = LinearConfig.load()
-    if not config:
-        console.print("[red]Error:[/red] Linear API key not configured.")
-        console.print("Run: [cyan]semfora-pm auth setup[/cyan]")
+def get_client(path: Optional[Path] = None) -> LinearClient:
+    """Get configured Linear client or exit with error.
+
+    Args:
+        path: Optional path for directory-based context detection
+    """
+    try:
+        if path:
+            return LinearClient.from_context(path)
+
+        # Try context-based first
+        context = resolve_context()
+        if context.api_key and context.has_team():
+            return LinearClient.from_context()
+
+        # Fall back to legacy config
+        config = LinearConfig.load()
+        if not config:
+            console.print("[red]Error:[/red] Linear API key not configured.")
+            console.print("")
+            console.print("To configure, use one of these methods:")
+            console.print("")
+            console.print("1. Create .pm/config.yaml in your project:")
+            console.print("   [cyan]semfora-pm init[/cyan]")
+            console.print("")
+            console.print("2. Set environment variable:")
+            console.print("   [cyan]export LINEAR_API_KEY=lin_api_xxx[/cyan]")
+            console.print("")
+            console.print("3. Run setup:")
+            console.print("   [cyan]semfora-pm auth setup[/cyan]")
+            raise typer.Exit(1)
+        return LinearClient(config)
+    except AuthenticationError as e:
+        console.print(f"[red]Authentication Error:[/red] {e}")
+        console.print("")
+        console.print(LinearConfig.get_auth_help_message())
         raise typer.Exit(1)
-    return LinearClient(config)
+
+
+# ============================================================================
+# Context Commands
+# ============================================================================
+
+
+@app.command("context")
+def show_context(
+    path: Optional[Path] = typer.Option(None, "--path", "-p", help="Path to check context for"),
+):
+    """Show detected PM context for current or specified directory.
+
+    Displays:
+    - Config source (directory, parent, user, none)
+    - Provider and team/project configuration
+    - Authentication status
+    """
+    target_path = path or Path.cwd()
+    context = resolve_context(target_path)
+
+    console.print(Panel(
+        get_context_help_message(context),
+        title=f"PM Context: {target_path}",
+        border_style="blue",
+    ))
+
+
+@app.command("init")
+def init_config(
+    path: Optional[Path] = typer.Option(None, "--path", "-p", help="Directory to initialize"),
+    team_name: Optional[str] = typer.Option(None, "--team", "-t", help="Linear team name"),
+    project_name: Optional[str] = typer.Option(None, "--project", help="Linear project name"),
+    api_key_env: Optional[str] = typer.Option(None, "--api-key-env", help="Environment variable for API key"),
+):
+    """Initialize .pm/config.yaml in current or specified directory.
+
+    Creates a .pm/ folder with configuration for Linear integration.
+    This enables directory-based context detection for multi-project workspaces.
+    """
+    target_path = Path(path) if path else Path.cwd()
+
+    if not target_path.exists():
+        console.print(f"[red]Error:[/red] Directory not found: {target_path}")
+        raise typer.Exit(1)
+
+    # Check if config already exists
+    existing_config = target_path / ".pm" / "config.yaml"
+    if existing_config.exists():
+        if not typer.confirm(f"Config already exists at {existing_config}. Overwrite?"):
+            raise typer.Exit(0)
+
+    # If no team specified, try to get from auth
+    if not team_name:
+        try:
+            config = LinearConfig.load()
+            if config:
+                client = LinearClient(config)
+                teams = client.get_teams()
+                if teams:
+                    console.print("\nSelect a team:")
+                    for i, team in enumerate(teams):
+                        console.print(f"  [{i + 1}] {team['name']} ({team['key']})")
+                    choice = typer.prompt("Enter number", type=int, default=1)
+                    if 1 <= choice <= len(teams):
+                        team_name = teams[choice - 1]["name"]
+        except Exception:
+            pass
+
+    if not team_name:
+        team_name = typer.prompt("Team name")
+
+    # Get project name if not specified
+    if not project_name:
+        project_name = typer.prompt("Project name (optional, press Enter to skip)", default="")
+        if not project_name:
+            project_name = None
+
+    # Create the config
+    config_path = create_pm_config(
+        path=target_path,
+        team_name=team_name,
+        project_name=project_name,
+        api_key_env=api_key_env,
+    )
+
+    console.print(f"\n[green]Created:[/green] {config_path}")
+    console.print("\n[dim]Config contents:[/dim]")
+    console.print(config_path.read_text())
+    console.print("\n[dim]Make sure LINEAR_API_KEY is set in your environment.[/dim]")
+
+
+@app.command("scan")
+def scan_directories(
+    path: Optional[Path] = typer.Option(None, "--path", "-p", help="Base directory to scan"),
+    max_depth: int = typer.Option(3, "--depth", "-d", help="Maximum depth to scan"),
+):
+    """Scan directory tree for .pm/ configurations.
+
+    Useful for discovering all PM-configured projects in a workspace.
+    """
+    target_path = Path(path) if path else Path.cwd()
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+        transient=True,
+    ) as progress:
+        progress.add_task(f"Scanning {target_path}...", total=None)
+        results = scan_pm_directories(target_path, max_depth)
+
+    if not results:
+        console.print("[yellow]No .pm/ configurations found.[/yellow]")
+        console.print(f"\nTo create one, run: [cyan]semfora-pm init --path <directory>[/cyan]")
+        raise typer.Exit(0)
+
+    table = Table(title="PM Configurations Found")
+    table.add_column("Path", style="cyan")
+    table.add_column("Provider", style="yellow")
+    table.add_column("Team", style="magenta")
+    table.add_column("Project", style="blue")
+
+    for info in results:
+        team_str = info.team_name or info.team_id or "—"
+        project_str = info.project_name or info.project_id or "—"
+        rel_path = info.path.relative_to(target_path) if info.path != target_path else Path(".")
+
+        table.add_row(
+            str(rel_path),
+            info.provider,
+            team_str,
+            project_str,
+        )
+
+    console.print(table)
+    console.print(f"\n[dim]Found {len(results)} configuration(s)[/dim]")
 
 
 # ============================================================================
@@ -111,15 +284,25 @@ def list_tickets(
     priority: Optional[int] = typer.Option(None, "-p", "--priority", help="Filter by priority (1=Urgent, 2=High, 3=Medium, 4=Low)"),
     limit: int = typer.Option(50, "--limit", help="Maximum tickets to show"),
     sprint: bool = typer.Option(False, "--sprint", help="Show only current sprint tickets (Todo/In Progress/In Review)"),
+    path: Optional[Path] = typer.Option(None, "--path", help="Path for context detection"),
 ):
     """List tickets from Linear with rich details.
 
     Shows ticket ID, title, state, priority, estimate, labels, and a short description.
     """
-    client = get_client()
-    config = LinearConfig.load()
+    client = get_client(path)
 
-    if not config.team_id:
+    # Get team_id from context or legacy config
+    context = resolve_context(path)
+    team_id = context.team_id
+    if not team_id and context.team_name:
+        team_id = client.get_team_id_by_name(context.team_name)
+
+    if not team_id:
+        config = LinearConfig.load()
+        team_id = config.team_id if config else None
+
+    if not team_id:
         console.print("[red]Error:[/red] No default team configured.")
         console.print("Run: [cyan]semfora-pm auth setup[/cyan]")
         raise typer.Exit(1)
@@ -131,7 +314,7 @@ def list_tickets(
         transient=True,
     ) as progress:
         progress.add_task("Fetching tickets from Linear...", total=None)
-        issues = client.get_team_issues(config.team_id, limit=limit * 2)  # Fetch extra for filtering
+        issues = client.get_team_issues(team_id, limit=limit * 2)  # Fetch extra for filtering
 
     # Apply filters
     if sprint:
@@ -214,13 +397,14 @@ def list_tickets(
 @app.command("show")
 def show_ticket(
     identifier: str = typer.Argument(..., help="Linear ticket identifier (e.g., SEM-123)"),
+    path: Optional[Path] = typer.Option(None, "--path", help="Path for context detection"),
 ):
     """Show full ticket details from Linear.
 
     Displays all available information for a ticket including full description,
     labels, assignee, dates, and related data.
     """
-    client = get_client()
+    client = get_client(path)
 
     with Progress(
         SpinnerColumn(),
@@ -1243,27 +1427,147 @@ sprint_app = typer.Typer(help="Sprint planning and management")
 app.add_typer(sprint_app, name="sprint")
 
 
+def _sprint_status_aggregated(base_path: Optional[Path] = None):
+    """Show aggregated sprint status across all .pm/ configs."""
+    target_path = base_path or Path.cwd()
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+        transient=True,
+    ) as progress:
+        progress.add_task("Scanning for .pm/ configs...", total=None)
+        dirs = scan_pm_directories(target_path, max_depth=3)
+
+    if not dirs:
+        # Fall back to single context
+        context = resolve_context(target_path)
+        if context.has_team():
+            console.print("[dim]No .pm/ configs found, using inherited context...[/dim]")
+            # Call the regular sprint_status
+            sprint_status(base_path, aggregate=False)
+            return
+        console.print("[yellow]No .pm/ configurations found.[/yellow]")
+        console.print(f"Run: [cyan]semfora-pm init --path <directory>[/cyan]")
+        raise typer.Exit(1)
+
+    # Track unique configs and aggregate issues
+    seen_configs: set[tuple] = set()
+    all_issues: dict[str, dict] = {}
+    projects_info: list[dict] = []
+    errors: list[str] = []
+
+    console.print(f"\n[bold]Aggregating sprint status from {len(dirs)} config(s)...[/bold]\n")
+
+    for dir_info in dirs:
+        config_key = (dir_info.team_id, dir_info.team_name, dir_info.project_id, dir_info.project_name)
+        if config_key in seen_configs:
+            console.print(f"  [dim]Skipping duplicate:[/dim] {dir_info.path.relative_to(target_path)}")
+            continue
+        seen_configs.add(config_key)
+
+        try:
+            client = get_client(dir_info.path)
+            context = resolve_context(dir_info.path)
+
+            team_id = context.team_id
+            if not team_id and context.team_name:
+                team_id = client.get_team_id_by_name(context.team_name)
+
+            if not team_id:
+                continue
+
+            issues = client.get_team_issues(team_id)
+
+            project_name = context.project_name or context.team_name or "Unknown"
+            rel_path = dir_info.path.relative_to(target_path) if dir_info.path != target_path else Path(".")
+            console.print(f"  [green]✓[/green] {rel_path} → {project_name} ({len(issues)} tickets)")
+
+            projects_info.append({
+                "path": str(rel_path),
+                "project": project_name,
+                "count": len(issues),
+            })
+
+            for issue in issues:
+                if issue["identifier"] not in all_issues:
+                    all_issues[issue["identifier"]] = issue
+
+        except Exception as e:
+            rel_path = dir_info.path.relative_to(target_path) if dir_info.path != target_path else Path(".")
+            errors.append(f"{rel_path}: {e}")
+            console.print(f"  [red]✗[/red] {rel_path}: {e}")
+
+    if not all_issues:
+        console.print("\n[yellow]No tickets found across configured projects.[/yellow]")
+        raise typer.Exit(0)
+
+    # Group by state
+    issues_list = list(all_issues.values())
+    todo = [i for i in issues_list if i["state"]["name"] == "Todo"]
+    in_progress = [i for i in issues_list if i["state"]["name"] == "In Progress"]
+    in_review = [i for i in issues_list if i["state"]["name"] == "In Review"]
+
+    console.print(f"\n[bold]Aggregated Sprint Status[/bold] ({len(all_issues)} unique tickets)")
+    console.print(f"[dim]From {len(projects_info)} project(s)[/dim]\n")
+
+    if in_progress:
+        console.print(f"[yellow]In Progress ({len(in_progress)}):[/yellow]")
+        for issue in in_progress:
+            priority = issue.get("priority", 0)
+            priority_icon = "🔴" if priority <= 1 else "🟡" if priority == 2 else "⚪"
+            console.print(f"  {priority_icon} {issue['identifier']}: {issue['title'][:50]}")
+
+    if in_review:
+        console.print(f"\n[blue]In Review ({len(in_review)}):[/blue]")
+        for issue in in_review:
+            console.print(f"  📝 {issue['identifier']}: {issue['title'][:50]}")
+
+    if todo:
+        console.print(f"\n[cyan]Todo ({len(todo)}):[/cyan]")
+        for issue in todo[:10]:
+            priority = issue.get("priority", 0)
+            priority_icon = "🔴" if priority <= 1 else "🟡" if priority == 2 else "⚪"
+            console.print(f"  {priority_icon} {issue['identifier']}: {issue['title'][:50]}")
+        if len(todo) > 10:
+            console.print(f"  [dim]...and {len(todo) - 10} more[/dim]")
+
+    total_active = len(in_progress) + len(in_review) + len(todo)
+    console.print(f"\n[dim]Total active: {total_active} tickets[/dim]")
+
+
 @sprint_app.command("plan")
 def sprint_plan(
     name: str = typer.Argument(..., help="Sprint name (e.g., 'sprint-1')"),
     tickets: str = typer.Option(..., "-t", "--tickets", help="Comma-separated Linear identifiers (e.g., SEM-32,SEM-33)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show plan without making changes"),
+    path: Optional[Path] = typer.Option(None, "--path", help="Path for context detection"),
 ):
     """Plan a sprint by moving tickets from Backlog to Todo.
 
     Use Linear identifiers (e.g., SEM-32, SEM-33) directly.
     """
-    client = get_client()
-    config = LinearConfig.load()
+    client = get_client(path)
 
-    if not config.team_id:
+    # Get team_id from context or legacy config
+    context = resolve_context(path)
+    team_id = context.team_id
+    if not team_id and context.team_name:
+        team_id = client.get_team_id_by_name(context.team_name)
+
+    if not team_id:
+        config = LinearConfig.load()
+        team_id = config.team_id if config else None
+
+    if not team_id:
         console.print("[red]Error:[/red] No default team configured.")
         raise typer.Exit(1)
 
     ticket_ids = [t.strip() for t in tickets.split(",")]
 
     # Fetch issues directly from Linear
-    all_issues = client.get_team_issues(config.team_id)
+    all_issues = client.get_team_issues(team_id)
     issue_by_id = {i["identifier"]: i for i in all_issues}
 
     # Resolve tickets
@@ -1312,7 +1616,7 @@ def sprint_plan(
         raise typer.Exit(0)
 
     # Move tickets to Todo state
-    states = client.get_team_states(config.team_id)
+    states = client.get_team_states(team_id)
     todo_state_id = states.get("Todo")
 
     if not todo_state_id:
@@ -1338,20 +1642,30 @@ def sprint_plan(
 def sprint_suggest(
     points: int = typer.Option(20, "-p", "--points", help="Target story points for sprint"),
     label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by label"),
+    path: Optional[Path] = typer.Option(None, "--path", help="Path for context detection"),
 ):
     """Suggest tickets for next sprint based on priority.
 
     Queries Linear backlog and suggests tickets that fit the point budget.
     """
-    client = get_client()
-    config = LinearConfig.load()
+    client = get_client(path)
 
-    if not config.team_id:
+    # Get team_id from context or legacy config
+    context = resolve_context(path)
+    team_id = context.team_id
+    if not team_id and context.team_name:
+        team_id = client.get_team_id_by_name(context.team_name)
+
+    if not team_id:
+        config = LinearConfig.load()
+        team_id = config.team_id if config else None
+
+    if not team_id:
         console.print("[red]Error:[/red] No default team configured.")
         raise typer.Exit(1)
 
     # Fetch issues directly from Linear
-    all_issues = client.get_team_issues(config.team_id)
+    all_issues = client.get_team_issues(team_id)
 
     # Filter to backlog tickets
     backlog = [i for i in all_issues if i["state"]["name"] == "Backlog"]
@@ -1419,16 +1733,36 @@ def sprint_suggest(
 
 
 @sprint_app.command("status")
-def sprint_status():
-    """Show current sprint status (tickets in Todo/In Progress)."""
-    client = get_client()
-    config = LinearConfig.load()
+def sprint_status(
+    path: Optional[Path] = typer.Option(None, "--path", help="Path for context detection"),
+    aggregate: bool = typer.Option(False, "--aggregate", "-a", help="Aggregate across all .pm/ configs in directory tree"),
+):
+    """Show current sprint status (tickets in Todo/In Progress).
 
-    if not config.team_id:
+    Use --aggregate to scan for all .pm/ configs and show combined sprint status
+    across all configured teams/projects (deduping when they share the same project).
+    """
+    if aggregate:
+        _sprint_status_aggregated(path)
+        return
+
+    client = get_client(path)
+
+    # Get team_id from context or legacy config
+    context = resolve_context(path)
+    team_id = context.team_id
+    if not team_id and context.team_name:
+        team_id = client.get_team_id_by_name(context.team_name)
+
+    if not team_id:
+        config = LinearConfig.load()
+        team_id = config.team_id if config else None
+
+    if not team_id:
         console.print("[red]Error:[/red] No default team configured.")
         raise typer.Exit(1)
 
-    issues = client.get_team_issues(config.team_id)
+    issues = client.get_team_issues(team_id)
 
     # Group by state
     todo = [i for i in issues if i["state"]["name"] == "Todo"]
@@ -1555,16 +1889,26 @@ app.add_typer(tickets_app, name="tickets")
 def tickets_search(
     query: str = typer.Argument(..., help="Search query for ticket titles"),
     limit: int = typer.Option(20, "--limit", help="Maximum results"),
+    path: Optional[Path] = typer.Option(None, "--path", help="Path for context detection"),
 ):
     """Search for existing tickets by title.
 
     Use this BEFORE creating tickets to check for duplicates.
     This is especially important for AI agents planning features.
     """
-    client = get_client()
-    config = LinearConfig.load()
+    client = get_client(path)
 
-    if not config.team_id:
+    # Get team_id from context or legacy config
+    context = resolve_context(path)
+    team_id = context.team_id
+    if not team_id and context.team_name:
+        team_id = client.get_team_id_by_name(context.team_name)
+
+    if not team_id:
+        config = LinearConfig.load()
+        team_id = config.team_id if config else None
+
+    if not team_id:
         console.print("[red]Error:[/red] No default team configured.")
         raise typer.Exit(1)
 
@@ -1575,7 +1919,7 @@ def tickets_search(
         transient=True,
     ) as progress:
         progress.add_task(f"Searching for '{query}'...", total=None)
-        issues = client.search_issues(query, config.team_id, limit)
+        issues = client.search_issues(query, team_id, limit)
 
     if not issues:
         console.print(f"[green]No existing tickets match '{query}'[/green]")
@@ -1604,6 +1948,7 @@ def tickets_update(
     add_labels: Optional[str] = typer.Option(None, "--add-labels", help="Comma-separated labels to add"),
     title: Optional[str] = typer.Option(None, "--title", help="New title"),
     description: Optional[str] = typer.Option(None, "--description", "-d", help="New description (use @filename to read from file)"),
+    path: Optional[Path] = typer.Option(None, "--path", help="Path for context detection"),
 ):
     """Update a ticket's status, priority, or other fields.
 
@@ -1630,10 +1975,19 @@ def tickets_update(
     # Add labels
     semfora-pm tickets update SEM-45 --add-labels "bug,urgent"
     """
-    client = get_client()
-    config = LinearConfig.load()
+    client = get_client(path)
 
-    if not config.team_id:
+    # Get team_id from context or legacy config
+    context = resolve_context(path)
+    team_id = context.team_id
+    if not team_id and context.team_name:
+        team_id = client.get_team_id_by_name(context.team_name)
+
+    if not team_id:
+        config = LinearConfig.load()
+        team_id = config.team_id if config else None
+
+    if not team_id:
         console.print("[red]Error:[/red] No default team configured.")
         raise typer.Exit(1)
 
@@ -1664,7 +2018,7 @@ def tickets_update(
     # Handle state change
     state_id = None
     if state:
-        states = client.get_team_states(config.team_id)
+        states = client.get_team_states(team_id)
         # Try exact match first, then case-insensitive
         state_id = states.get(state)
         if not state_id:
@@ -1744,6 +2098,7 @@ def tickets_create(
     skip_duplicates: bool = typer.Option(False, "--skip-duplicates", help="Skip duplicate check"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be created without creating"),
     yes: bool = typer.Option(False, "-y", "--yes", help="Skip confirmation prompts"),
+    path: Optional[Path] = typer.Option(None, "--path", help="Path for context detection"),
 ):
     """Create multiple tickets with relationships from a YAML/JSON file.
 
@@ -1785,10 +2140,19 @@ def tickets_create(
     import yaml
     import json
 
-    client = get_client()
-    config = LinearConfig.load()
+    client = get_client(path)
 
-    if not config.team_id:
+    # Get team_id from context or legacy config
+    context = resolve_context(path)
+    team_id = context.team_id
+    if not team_id and context.team_name:
+        team_id = client.get_team_id_by_name(context.team_name)
+
+    if not team_id:
+        config = LinearConfig.load()
+        team_id = config.team_id if config else None
+
+    if not team_id:
         console.print("[red]Error:[/red] No default team configured.")
         raise typer.Exit(1)
 
@@ -1826,11 +2190,38 @@ def tickets_create(
             raise typer.Exit(1)
         temp_ids.add(ticket["id"])
 
-    # Validate references
+    # Collect all external Linear IDs referenced (e.g., SEM-14, PROJ-123)
+    external_refs = set()
     for ticket in tickets_data:
         for ref in ticket.get("blocked_by", []) + ticket.get("blocks", []) + ticket.get("related", []):
             if ref not in temp_ids:
-                console.print(f"[red]Error:[/red] Unknown reference '{ref}' in ticket '{ticket['id']}'")
+                # Check if it looks like a Linear ID (e.g., SEM-14, PROJ-123)
+                if "-" in ref and ref.split("-")[0].isupper() and ref.split("-")[-1].isdigit():
+                    external_refs.add(ref)
+                else:
+                    console.print(f"[red]Error:[/red] Unknown reference '{ref}' in ticket '{ticket['id']}'")
+                    console.print(f"[dim]Hint: Use Linear IDs (e.g., SEM-14) for existing tickets or temp IDs defined in this file[/dim]")
+                    raise typer.Exit(1)
+
+    # Look up external Linear IDs to get their UUIDs
+    external_id_mapping: dict[str, dict] = {}  # Linear ID -> {id: uuid, identifier: SEM-XX}
+    if external_refs:
+        console.print(f"\n[dim]Looking up {len(external_refs)} existing ticket(s)...[/dim]")
+        for linear_id in external_refs:
+            try:
+                issue = client.get_issue_by_identifier(linear_id)
+                if issue:
+                    external_id_mapping[linear_id] = {
+                        "id": issue["id"],
+                        "identifier": issue["identifier"],
+                        "title": issue.get("title", ""),
+                    }
+                    console.print(f"  [green]✓[/green] Found {linear_id}: {issue.get('title', '')[:40]}")
+                else:
+                    console.print(f"[red]Error:[/red] Could not find Linear ticket '{linear_id}'")
+                    raise typer.Exit(1)
+            except Exception as e:
+                console.print(f"[red]Error:[/red] Failed to look up '{linear_id}': {e}")
                 raise typer.Exit(1)
 
     # Check for circular dependencies in blocked_by
@@ -1876,7 +2267,7 @@ def tickets_create(
             transient=True,
         ) as progress:
             progress.add_task("Searching for similar tickets...", total=None)
-            similar = client.search_issues_multi(titles, config.team_id)
+            similar = client.search_issues_multi(titles, team_id)
 
         if similar:
             console.print(f"\n[yellow]⚠️  Found {len(similar)} potentially similar existing tickets:[/yellow]\n")
@@ -1955,7 +2346,7 @@ def tickets_create(
     # Get project ID if specified
     project_id = None
     if data.get("project"):
-        projects = client.get_projects(config.team_id)
+        projects = client.get_projects(team_id)
         project = next((p for p in projects if p["name"].lower() == data["project"].lower()), None)
         if project:
             project_id = project["id"]
@@ -1975,7 +2366,7 @@ def tickets_create(
     # Get Todo state ID for sprint
     todo_state_id = None
     if data.get("sprint"):
-        states = client.get_team_states(config.team_id)
+        states = client.get_team_states(team_id)
         todo_state_id = states.get("Todo")
 
     # Create tickets and track temp_id -> linear_id mapping
@@ -1994,7 +2385,7 @@ def tickets_create(
                 issue = client.create_issue(
                     title=ticket["title"],
                     description=ticket.get("description", ""),
-                    team_id=config.team_id,
+                    team_id=team_id,
                     priority=ticket.get("priority", 3),
                     labels=ticket.get("labels"),
                     estimate=ticket.get("estimate"),
@@ -2017,6 +2408,9 @@ def tickets_create(
             progress.advance(task)
 
     # === CREATE RELATIONSHIPS ===
+    # Merge id_mapping with external_id_mapping for relationship lookups
+    all_id_mapping = {**id_mapping, **external_id_mapping}
+
     relations_to_create = []
     for ticket in tickets_data:
         if ticket["id"] not in id_mapping:
@@ -2025,39 +2419,43 @@ def tickets_create(
         linear_id = id_mapping[ticket["id"]]["id"]
 
         # blocked_by -> the other ticket blocks this one
-        for blocker_temp_id in ticket.get("blocked_by", []):
-            if blocker_temp_id in id_mapping:
+        for blocker_ref in ticket.get("blocked_by", []):
+            if blocker_ref in all_id_mapping:
                 relations_to_create.append({
-                    "from": id_mapping[blocker_temp_id],
+                    "from": all_id_mapping[blocker_ref],
                     "to": id_mapping[ticket["id"]],
                     "type": "blocks",
-                    "desc": f"{id_mapping[blocker_temp_id]['identifier']} blocks {id_mapping[ticket['id']]['identifier']}",
+                    "desc": f"{all_id_mapping[blocker_ref]['identifier']} blocks {id_mapping[ticket['id']]['identifier']}",
                 })
 
         # blocks -> this ticket blocks the other
-        for blocked_temp_id in ticket.get("blocks", []):
-            if blocked_temp_id in id_mapping:
+        for blocked_ref in ticket.get("blocks", []):
+            if blocked_ref in all_id_mapping:
                 relations_to_create.append({
                     "from": id_mapping[ticket["id"]],
-                    "to": id_mapping[blocked_temp_id],
+                    "to": all_id_mapping[blocked_ref],
                     "type": "blocks",
-                    "desc": f"{id_mapping[ticket['id']]['identifier']} blocks {id_mapping[blocked_temp_id]['identifier']}",
+                    "desc": f"{id_mapping[ticket['id']]['identifier']} blocks {all_id_mapping[blocked_ref]['identifier']}",
                 })
 
         # related
-        for related_temp_id in ticket.get("related", []):
-            if related_temp_id in id_mapping:
+        for related_ref in ticket.get("related", []):
+            if related_ref in all_id_mapping:
+                # Get identifiers for dedup check
+                this_identifier = id_mapping[ticket["id"]]["identifier"]
+                related_identifier = all_id_mapping[related_ref]["identifier"]
+
                 # Avoid duplicate relations (A related B == B related A)
-                pair = tuple(sorted([ticket["id"], related_temp_id]))
+                pair = tuple(sorted([this_identifier, related_identifier]))
                 if not any(
-                    r["type"] == "related" and tuple(sorted([r["from"]["identifier"], r["to"]["identifier"]])) == (id_mapping[pair[0]]["identifier"], id_mapping[pair[1]]["identifier"])
+                    r["type"] == "related" and tuple(sorted([r["from"]["identifier"], r["to"]["identifier"]])) == pair
                     for r in relations_to_create
                 ):
                     relations_to_create.append({
                         "from": id_mapping[ticket["id"]],
-                        "to": id_mapping[related_temp_id],
+                        "to": all_id_mapping[related_ref],
                         "type": "related",
-                        "desc": f"{id_mapping[ticket['id']]['identifier']} <-> {id_mapping[related_temp_id]['identifier']} (related)",
+                        "desc": f"{this_identifier} <-> {related_identifier} (related)",
                     })
 
     if relations_to_create:

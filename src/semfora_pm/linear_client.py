@@ -3,14 +3,25 @@
 import os
 import json
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 from pathlib import Path
 import urllib.request
 import urllib.error
 
+if TYPE_CHECKING:
+    from .pm_config import PMContext
+
 LINEAR_API_URL = "https://api.linear.app/graphql"
 CONFIG_DIR = Path.home() / ".config" / "semfora-pm"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+
+
+class AuthenticationError(Exception):
+    """Raised when Linear authentication fails or is not configured."""
+
+    def __init__(self, message: str, suggestions: list[str] | None = None):
+        super().__init__(message)
+        self.suggestions = suggestions or []
 
 
 @dataclass
@@ -29,6 +40,8 @@ class LinearConfig:
                 "team_id": self.team_id,
                 "project_id": self.project_id,
             }, f, indent=2)
+        # Secure the file
+        os.chmod(CONFIG_FILE, 0o600)
 
     @classmethod
     def load(cls) -> Optional["LinearConfig"]:
@@ -36,7 +49,18 @@ class LinearConfig:
         # Try environment variable first
         api_key = os.environ.get("LINEAR_API_KEY")
         if api_key:
-            return cls(api_key=api_key)
+            # Also try to get team_id from config file even if using env key
+            team_id = None
+            project_id = None
+            if CONFIG_FILE.exists():
+                try:
+                    with open(CONFIG_FILE) as f:
+                        data = json.load(f)
+                    team_id = data.get("team_id")
+                    project_id = data.get("project_id")
+                except Exception:
+                    pass
+            return cls(api_key=api_key, team_id=team_id, project_id=project_id)
 
         # Try config file
         if CONFIG_FILE.exists():
@@ -50,6 +74,41 @@ class LinearConfig:
 
         return None
 
+    @classmethod
+    def from_context(cls, context: "PMContext") -> Optional["LinearConfig"]:
+        """Create LinearConfig from a PMContext."""
+        if not context.api_key:
+            return None
+        return cls(
+            api_key=context.api_key,
+            team_id=context.team_id,
+            project_id=context.project_id,
+        )
+
+    @classmethod
+    def get_auth_help_message(cls) -> str:
+        """Get helpful message about authentication options."""
+        return """Linear authentication not configured.
+
+To authenticate, use one of these methods:
+
+1. Environment variable:
+   $ export LINEAR_API_KEY=lin_api_xxxxxxxxxxxx
+
+2. Run auth setup:
+   $ semfora-pm auth setup
+
+3. Create .pm/config.yaml in your project:
+   provider: linear
+   linear:
+     team_name: "Your Team"
+
+   And set LINEAR_API_KEY environment variable.
+
+To get an API key:
+   https://linear.app/settings/api
+"""
+
 
 class LinearClient:
     """Client for Linear GraphQL API."""
@@ -58,7 +117,97 @@ class LinearClient:
         self.config = config
         self._label_cache: dict[str, str] = {}  # name -> id
         self._team_cache: dict[str, dict] = {}  # id -> team data
+        self._team_name_cache: dict[str, str] = {}  # name.lower() -> id
         self._state_cache: dict[str, dict] = {}  # team_id -> {name: id}
+        self._project_cache: dict[str, dict] = {}  # id -> project data
+        self._project_name_cache: dict[str, str] = {}  # name.lower() -> id
+
+    @classmethod
+    def from_context(cls, path_or_context: "PMContext | Path | None" = None) -> "LinearClient":
+        """Create a LinearClient from a PMContext or path, resolving names to IDs.
+
+        Args:
+            path_or_context: Either a PMContext, a Path to resolve context from,
+                           or None to use current directory.
+        """
+        from .pm_config import resolve_context, PMContext
+
+        # Resolve to PMContext if needed
+        if path_or_context is None:
+            context = resolve_context()
+        elif isinstance(path_or_context, PMContext):
+            context = path_or_context
+        else:
+            # It's a Path
+            context = resolve_context(path_or_context)
+
+        if not context.api_key:
+            raise AuthenticationError(
+                "Linear API key not configured.",
+                suggestions=[
+                    "Set: export LINEAR_API_KEY=lin_api_xxx",
+                    "Or run: semfora-pm auth setup",
+                ],
+            )
+
+        config = LinearConfig(
+            api_key=context.api_key,
+            team_id=context.team_id,
+            project_id=context.project_id,
+        )
+
+        client = cls(config)
+
+        # Resolve team name to ID if needed
+        if not config.team_id and context.team_name:
+            team_id = client.get_team_id_by_name(context.team_name)
+            if team_id:
+                client.config.team_id = team_id
+            else:
+                raise ValueError(f"Team not found: {context.team_name}")
+
+        # Resolve project name to ID if needed
+        if not config.project_id and context.project_name:
+            project_id = client.get_project_id_by_name(
+                context.project_name,
+                team_id=client.config.team_id,
+            )
+            if project_id:
+                client.config.project_id = project_id
+            # Don't error if project not found - it's optional
+
+        return client
+
+    def get_team_id_by_name(self, name: str) -> Optional[str]:
+        """Get team ID by name (case-insensitive)."""
+        name_lower = name.lower()
+
+        # Check cache
+        if name_lower in self._team_name_cache:
+            return self._team_name_cache[name_lower]
+
+        # Fetch teams and build cache
+        teams = self.get_teams()
+        for team in teams:
+            self._team_name_cache[team["name"].lower()] = team["id"]
+
+        return self._team_name_cache.get(name_lower)
+
+    def get_project_id_by_name(
+        self,
+        name: str,
+        team_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Get project ID by name (case-insensitive)."""
+        name_lower = name.lower()
+
+        # Fetch projects and search
+        projects = self.get_projects(team_id)
+        for project in projects:
+            if project["name"].lower() == name_lower:
+                return project["id"]
+
+        return None
 
     def _request(self, query: str, variables: Optional[dict] = None) -> dict:
         """Make GraphQL request to Linear API."""
@@ -161,23 +310,38 @@ class LinearClient:
         return projects
 
     def get_labels(self, team_id: Optional[str] = None) -> list[dict]:
-        """Get all labels."""
-        query = """
-        query {
-            issueLabels {
-                nodes {
-                    id
-                    name
-                    color
+        """Get all labels with pagination to ensure we fetch all labels."""
+        all_labels = []
+        cursor = None
+
+        while True:
+            query = """
+            query($first: Int!, $after: String) {
+                issueLabels(first: $first, after: $after) {
+                    nodes {
+                        id
+                        name
+                        color
+                    }
+                    pageInfo {
+                        hasNextPage
+                        endCursor
+                    }
                 }
             }
-        }
-        """
-        result = self._request(query)
-        labels = result["issueLabels"]["nodes"]
-        for label in labels:
+            """
+            result = self._request(query, {"first": 100, "after": cursor})
+            labels = result["issueLabels"]["nodes"]
+            all_labels.extend(labels)
+
+            page_info = result["issueLabels"]["pageInfo"]
+            if not page_info["hasNextPage"]:
+                break
+            cursor = page_info["endCursor"]
+
+        for label in all_labels:
             self._label_cache[label["name"].lower()] = label["id"]
-        return labels
+        return all_labels
 
     def get_team_issues(self, team_id: str, limit: int = 250) -> list[dict]:
         """Get all issues for a team."""
@@ -359,12 +523,12 @@ class LinearClient:
         if name.lower() in self._label_cache:
             return self._label_cache[name.lower()]
 
-        # Refresh cache
+        # Refresh cache (with pagination)
         self.get_labels()
         if name.lower() in self._label_cache:
             return self._label_cache[name.lower()]
 
-        # Create label
+        # Try to create label
         mutation = """
         mutation($input: IssueLabelCreateInput!) {
             issueLabelCreate(input: $input) {
@@ -376,15 +540,40 @@ class LinearClient:
             }
         }
         """
-        result = self._request(mutation, {
-            "input": {
-                "name": name,
-                "teamId": team_id,
-            }
-        })
-        label_id = result["issueLabelCreate"]["issueLabel"]["id"]
-        self._label_cache[name.lower()] = label_id
-        return label_id
+        try:
+            result = self._request(mutation, {
+                "input": {
+                    "name": name,
+                    "teamId": team_id,
+                }
+            })
+            label_id = result["issueLabelCreate"]["issueLabel"]["id"]
+            self._label_cache[name.lower()] = label_id
+            return label_id
+        except Exception as e:
+            # If label already exists (duplicate), search for it by name
+            if "duplicate label" in str(e).lower() or "already exists" in str(e).lower():
+                # Search for the existing label directly
+                search_query = """
+                query($filter: IssueLabelFilter) {
+                    issueLabels(filter: $filter) {
+                        nodes {
+                            id
+                            name
+                        }
+                    }
+                }
+                """
+                result = self._request(search_query, {
+                    "filter": {"name": {"eq": name}}
+                })
+                labels = result["issueLabels"]["nodes"]
+                if labels:
+                    label_id = labels[0]["id"]
+                    self._label_cache[name.lower()] = label_id
+                    return label_id
+            # Re-raise if not a duplicate error
+            raise
 
     def create_issue(
         self,
