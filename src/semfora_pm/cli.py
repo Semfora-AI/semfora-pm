@@ -506,6 +506,63 @@ def show_ticket(
     console.print(Panel(panel_content, title=f"Ticket: {issue['identifier']}", border_style="blue"))
 
 
+@app.command("get-ticket")
+def get_ticket_json(
+    identifier: str = typer.Argument(..., help="Linear ticket identifier (e.g., SEM-123)"),
+    path: Optional[Path] = typer.Option(None, "--path", help="Path for context detection"),
+    format: str = typer.Option("json", "--format", "-f", help="Output format (json)"),
+):
+    """Get ticket details as JSON (for programmatic use by AI agents)."""
+    import json
+
+    client = get_client(path)
+    issue = client.get_issue_full(identifier)
+
+    if not issue:
+        print(json.dumps({"error": f"Ticket not found: {identifier}"}))
+        raise typer.Exit(1)
+
+    # Priority mapping
+    priority_map = {0: "None", 1: "Urgent", 2: "High", 3: "Medium", 4: "Low"}
+
+    # Extract structured data
+    result = {
+        "identifier": issue.get("identifier"),
+        "title": issue.get("title"),
+        "description": issue.get("description") or "",
+        "state": issue.get("state", {}).get("name"),
+        "priority": priority_map.get(issue.get("priority", 0), "None"),
+        "priority_number": issue.get("priority", 0),
+        "estimate": issue.get("estimate"),
+        "labels": [l["name"] for l in issue.get("labels", {}).get("nodes", [])],
+        "assignee": issue.get("assignee", {}).get("name") if issue.get("assignee") else None,
+        "project": issue.get("project", {}).get("name") if issue.get("project") else None,
+        "cycle": issue.get("cycle", {}).get("name") if issue.get("cycle") else None,
+        "created_at": issue.get("createdAt"),
+        "updated_at": issue.get("updatedAt"),
+        "parent": {
+            "identifier": issue.get("parent", {}).get("identifier"),
+            "title": issue.get("parent", {}).get("title"),
+        } if issue.get("parent") else None,
+        "sub_issues": [
+            {"identifier": s["identifier"], "title": s["title"], "state": s.get("state", {}).get("name")}
+            for s in issue.get("children", {}).get("nodes", [])
+        ],
+        "blocks": [
+            {"identifier": r.get("relatedIssue", {}).get("identifier"), "title": r.get("relatedIssue", {}).get("title")}
+            for r in issue.get("relations", {}).get("nodes", [])
+            if r.get("type") == "blocks"
+        ],
+        "blocked_by": [
+            {"identifier": r.get("relatedIssue", {}).get("identifier"), "title": r.get("relatedIssue", {}).get("title")}
+            for r in issue.get("relations", {}).get("nodes", [])
+            if r.get("type") == "blocked"
+        ],
+    }
+
+    print(json.dumps(result))
+
+
 # ============================================================================
 # Sync Commands
 # ============================================================================
