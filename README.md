@@ -1,134 +1,164 @@
 # Semfora PM
 
-Project management CLI for Semfora - manages tickets as YAML files and syncs them to Linear.
+Connect your AI coding assistant to Linear. Get full ticket context, track progress, and never miss a requirement again.
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+
+## Quick Start
+
+```bash
+# Install
+pip install semfora-pm
+
+# Set your Linear API key
+export LINEAR_API_KEY=lin_api_...
+
+# Initialize in your project
+cd your-project
+semfora-pm init
+
+# Check sprint status
+semfora-pm sprint status
+```
 
 ## Features
 
-- **YAML-based tickets**: Define tickets in version-controlled YAML files
-- **Linear sync**: Push tickets to Linear with proper labels (not comma-separated!)
-- **Bidirectional tracking**: Linear IDs saved back to YAML after sync
-- **Component organization**: Tickets organized by component (engine, adk, cli)
-- **Phase tracking**: Track implementation phases and dependencies
+- **Linear integration** - Bidirectional sync with Linear
+- **Sprint tracking** - See what's in progress, todo, and done
+- **Full context** - Get complete ticket details including acceptance criteria
+- **AI-ready** - MCP server for Claude Code and other AI assistants
+- **CLI first** - Fast terminal interface for developers
 
 ## Installation
 
+### Prerequisites
+
+- Python 3.10+
+- Linear API key ([get one here](https://linear.app/settings/api))
+
+### macOS / Linux
+
 ```bash
+# With pip
+pip install semfora-pm
+
+# Or with uv (recommended)
+uv pip install semfora-pm
+```
+
+### Windows
+
+```powershell
+# With pip
+pip install semfora-pm
+
+# Or with uv
+uv pip install semfora-pm
+```
+
+### From Source
+
+```bash
+git clone https://github.com/Semfora-AI/semfora-pm.git
 cd semfora-pm
 pip install -e .
 ```
 
-## Quick Start
-
-### 1. Configure Linear API
-
-Get your API key from Linear Settings → API → Personal API keys.
-
-```bash
-semfora-pm auth setup
-# Enter your API key when prompted
-```
-
-### 2. Import existing CSV tickets
-
-```bash
-# Import engine tickets
-semfora-pm import-csv ../linear-import/semfora-engine-tasks.csv -c engine
-
-# Import ADK tickets
-semfora-pm import-csv ../linear-import/semfora-adk-tasks.csv -c adk
-
-# Import CLI tickets
-semfora-pm import-csv ../linear-import/semfora-cli-tasks.csv -c cli
-```
-
-### 3. Push to Linear
-
-```bash
-# Dry run first
-semfora-pm sync push --dry-run
-
-# Push all tickets
-semfora-pm sync push
-
-# Push specific component
-semfora-pm sync push -c engine
-
-# Push to a specific project
-semfora-pm sync push -p "Semfora"
-```
-
-## Commands
-
-### Authentication
-
-```bash
-semfora-pm auth setup     # Configure API key
-semfora-pm auth status    # Check authentication
-```
-
-### Tickets
-
-```bash
-semfora-pm list                    # List all tickets
-semfora-pm list -c engine          # Filter by component
-semfora-pm list --not-synced       # Show unsynced tickets
-semfora-pm show engine-001         # Show ticket details
-```
-
-### Sync
-
-```bash
-semfora-pm sync push              # Push tickets to Linear
-semfora-pm sync push --dry-run    # Preview changes
-semfora-pm sync status            # Show sync status
-```
-
-### Projects
-
-```bash
-semfora-pm project list           # List Linear projects
-semfora-pm project labels         # List available labels
-```
-
-## Ticket YAML Format
-
-Tickets are stored in `tickets/{component}.yaml`:
-
-```yaml
-tickets:
-  - id: engine-001
-    title: Implement incremental re-indexing
-    description: |
-      ## Overview
-      Add ability to update the semantic index incrementally...
-    component: engine
-    priority: 2
-    status: Backlog
-    labels:
-      - indexing
-      - north-star
-    estimate: 8
-    phase: phase-2
-    depends_on: []
-    blocks:
-      - engine-003
-    linear_id: null  # Populated after sync
-    linear_url: null
-```
-
-## Environment Variables
-
-- `LINEAR_API_KEY`: Linear API key (alternative to config file)
-
 ## Configuration
 
-Config stored at `~/.config/semfora-pm/config.json`:
+Set your Linear API key:
 
-```json
-{
-  "api_key": "lin_api_...",
-  "team_id": "...",
-  "project_id": "..."
-}
+```bash
+# Environment variable (recommended)
+export LINEAR_API_KEY=lin_api_...
+
+# Or configure via CLI
+semfora-pm auth setup
 ```
-# semforma-pm
+
+Initialize in your project to link it to a Linear team:
+
+```bash
+cd your-project
+semfora-pm init
+```
+
+This creates a `.pm/config.yaml` linking your project to Linear.
+
+## Basic Usage
+
+### Check sprint status
+
+```bash
+semfora-pm sprint status
+```
+
+Shows tickets by state: In Progress, In Review, Todo.
+
+### View ticket details
+
+```bash
+semfora-pm show SEM-123
+```
+
+Get full ticket context including description, acceptance criteria, and blockers.
+
+### List tickets
+
+```bash
+# All tickets in current sprint
+semfora-pm sprint status
+
+# Filter by state
+semfora-pm tickets search "authentication"
+```
+
+### Update ticket status
+
+```bash
+semfora-pm tickets update SEM-123 -s "In Progress"
+semfora-pm tickets update SEM-123 -s "Done"
+```
+
+### Get next ticket suggestion
+
+```bash
+semfora-pm sprint suggest
+```
+
+AI-powered suggestion for what to work on next based on priority and dependencies.
+
+## Documentation
+
+For detailed documentation including MCP integration and AI workflows, visit:
+
+**[semfora.com/docs/pm](https://semfora.com/docs/pm)**
+
+## Contributing
+
+We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
+
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+### Development Setup
+
+```bash
+git clone https://github.com/Semfora-AI/semfora-pm.git
+cd semfora-pm
+uv venv
+source .venv/bin/activate
+uv pip install -e ".[dev]"
+```
+
+## License
+
+MIT License - see [LICENSE](LICENSE) for details.
+
+---
+
+Part of the [Semfora](https://semfora.com) suite of code intelligence tools.
