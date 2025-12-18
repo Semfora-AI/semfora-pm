@@ -19,6 +19,8 @@ dependencies = [
     "rich>=13.0",
     "typer>=0.9.0",
     "mcp[cli]>=1.0.0",
+    "platformdirs>=4.0",
+    "textual>=0.47.0",
 ]
 
 [project.optional-dependencies]

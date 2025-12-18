@@ -1,3 +1,17 @@
+# Project Management Configuration
+# Local-only mode (no Linear authentication)
 provider: linear
+
 linear:
-  team_name: extensions
+  # Team configuration (placeholder - Linear features disabled without API key)
+  team_name: "Local Development"
+
+# Local storage settings
+local:
+  # Database stored in .pm/cache.db by default
+  cache_dir: null
+
+# Plans configuration
+plans:
+  # Don't auto-fetch tickets when linking (no Linear access)
+  auto_link_tickets: false

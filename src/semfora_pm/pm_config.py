@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Optional
 
 import yaml
+from platformdirs import user_cache_dir
 
 # User-level config location
 USER_CONFIG_DIR = Path.home() / ".config" / "semfora-pm"
@@ -77,6 +78,10 @@ class PMContext:
     api_key: Optional[str] = None
     api_key_env: str = "LINEAR_API_KEY"
 
+    # Local storage settings
+    cache_dir: Optional[str] = None  # Override database location
+    auto_link_tickets: bool = True  # Auto-cache ticket when linking plans
+
     def has_team(self) -> bool:
         """Check if team is configured (ID or name)."""
         return bool(self.team_id or self.team_name)
@@ -84,6 +89,27 @@ class PMContext:
     def has_project(self) -> bool:
         """Check if project is configured (ID or name)."""
         return bool(self.project_id or self.project_name)
+
+    def get_db_path(self) -> Path:
+        """Get the database path for this context.
+
+        Resolution order:
+        1. Custom cache_dir from config (if set)
+        2. Same directory as .pm/config.yaml (default)
+        3. User cache directory fallback
+
+        Returns:
+            Path to the SQLite database file
+        """
+        if self.cache_dir:
+            return Path(self.cache_dir) / "cache.db"
+
+        if self.config_path:
+            # Store next to config.yaml: .pm/cache.db
+            return self.config_path.parent / "cache.db"
+
+        # Fallback to user cache
+        return Path(user_cache_dir("semfora-pm", "Semfora")) / "default.db"
 
 
 @dataclass
@@ -186,6 +212,14 @@ def resolve_context(path: Optional[Path] = None) -> PMContext:
         # Auth config
         auth_config = data.get("auth", {})
         context.api_key_env = auth_config.get("api_key_env", "LINEAR_API_KEY")
+
+        # Local storage config
+        local_config = data.get("local", {})
+        context.cache_dir = local_config.get("cache_dir")
+
+        # Plans config
+        plans_config = data.get("plans", {})
+        context.auto_link_tickets = plans_config.get("auto_link_tickets", True)
 
     # Step 2: Fall back to user config if no team found
     if not context.has_team():

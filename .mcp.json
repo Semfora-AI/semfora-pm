@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "semfora-pm": {
+      "command": "/home/kadajett/Dev/Semfora_org/semfora-pm/.venv/bin/python",
+      "args": ["-m", "semfora_pm.mcp_server"],
+      "env": {}
+    }
+  }
+}

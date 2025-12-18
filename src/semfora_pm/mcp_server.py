@@ -19,6 +19,14 @@ from .pm_config import (
     scan_pm_directories,
     get_context_help_message,
 )
+from .db import Database
+from .local_tickets import LocalTicketManager, LocalTicket
+from .dependencies import DependencyManager
+from .external_items import (
+    ExternalItemsManager,
+    normalize_linear_status,
+    normalize_linear_priority,
+)
 
 # Create the MCP server
 mcp = FastMCP(
@@ -113,6 +121,186 @@ def _format_issue_summary(issue: dict) -> dict:
         "estimate": issue.get("estimate"),
         "labels": labels,
         "url": issue.get("url"),
+    }
+
+
+# ============================================================================
+# Local Plans Helper Functions
+# ============================================================================
+
+
+def _get_db_for_path(path: Optional[str] = None) -> tuple[Database, str, PMContext]:
+    """Get Database and project_id for a path.
+
+    Returns (db, project_id, context) tuple.
+    Creates project record if needed.
+    """
+    path_obj = Path(path) if path else None
+    context = resolve_context(path_obj)
+
+    db = Database(context.get_db_path())
+    project_id = _ensure_project(db, context)
+
+    return db, project_id, context
+
+
+def _ensure_project(db: Database, context: PMContext) -> str:
+    """Create or get project record for this context.
+
+    Returns project_id.
+    """
+    import uuid
+
+    if not context.config_path:
+        # Use a default project for unconfigured contexts
+        config_path = str(context.get_db_path().parent / "default")
+    else:
+        config_path = str(context.config_path)
+
+    with db.connection() as conn:
+        # Check if project exists
+        row = conn.execute(
+            "SELECT id FROM projects WHERE config_path = ?",
+            (config_path,),
+        ).fetchone()
+
+        if row:
+            return row["id"]
+
+    # Create new project
+    project_id = str(uuid.uuid4())
+    name = context.project_name or context.team_name or "Default Project"
+
+    with db.transaction() as conn:
+        conn.execute(
+            """
+            INSERT INTO projects (id, name, config_path, provider, provider_team_id, provider_project_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_id,
+                name,
+                config_path,
+                context.provider,
+                context.team_id,
+                context.project_id,
+            ),
+        )
+
+    return project_id
+
+
+def _cache_external_item(
+    db: Database,
+    project_id: str,
+    provider_id: str,
+    path: Optional[str] = None,
+) -> Optional[str]:
+    """Cache a Linear ticket and return its internal UUID.
+
+    Fetches from Linear API if not cached or stale.
+    Returns None if ticket not found.
+    """
+    manager = ExternalItemsManager(db, project_id)
+
+    # Check if already cached and fresh
+    existing = manager.get_by_provider_id(provider_id)
+    if existing and not manager.is_stale(provider_id):
+        return existing.id
+
+    # Fetch from Linear
+    client, context, error = _get_client_safe(path)
+    if error or not client:
+        # Can't fetch, return existing if available
+        return existing.id if existing else None
+
+    issue = client.get_issue_full(provider_id)
+    if not issue:
+        return existing.id if existing else None
+
+    # Get epic info if available
+    parent = issue.get("parent")
+    epic_id = None
+    epic_name = None
+    if parent:
+        epic_id = parent.get("identifier")
+        epic_name = parent.get("title")
+
+    # Get assignee info
+    assignee = issue.get("assignee")
+    assignee_id = assignee.get("id") if assignee else None
+    assignee_name = assignee.get("name") if assignee else None
+
+    # Get labels
+    labels = [l["name"] for l in issue.get("labels", {}).get("nodes", [])]
+
+    # Get cycle/sprint info
+    cycle = issue.get("cycle")
+    sprint_id = cycle.get("id") if cycle else None
+    sprint_name = cycle.get("name") if cycle else None
+
+    # Cache the item
+    item = manager.cache_item(
+        provider_id=provider_id,
+        title=issue["title"],
+        item_type="ticket",
+        description=issue.get("description"),
+        status=issue["state"]["name"],
+        status_category=normalize_linear_status(issue["state"]["name"]),
+        priority=normalize_linear_priority(issue.get("priority")),
+        assignee=assignee_id,
+        assignee_name=assignee_name,
+        labels=labels,
+        epic_id=epic_id,
+        epic_name=epic_name,
+        sprint_id=sprint_id,
+        sprint_name=sprint_name,
+        url=issue.get("url"),
+        provider_data=issue,
+        created_at_provider=issue.get("createdAt"),
+        updated_at_provider=issue.get("updatedAt"),
+    )
+
+    return item.id
+
+
+def _format_local_ticket(ticket: LocalTicket) -> dict:
+    """Format a LocalTicket for API response (full details)."""
+    return {
+        "id": ticket.id,
+        "title": ticket.title,
+        "description": ticket.description,
+        "status": ticket.status,
+        "priority": ticket.priority,
+        "tags": ticket.tags,
+        "parent_ticket": {
+            "id": ticket.linked_ticket_id,
+            "title": ticket.linked_ticket_title,
+        } if ticket.linked_ticket_id else None,
+        "epic": {
+            "id": ticket.linked_epic_id,
+            "name": ticket.linked_epic_name,
+        } if ticket.linked_epic_id else None,
+        "created_at": ticket.created_at,
+        "updated_at": ticket.updated_at,
+        "completed_at": ticket.completed_at,
+    }
+
+
+def _format_local_ticket_summary(ticket: LocalTicket) -> dict:
+    """Format a LocalTicket for list display (minimal, ~25 tokens vs ~100+).
+
+    Excludes description, timestamps, and nested objects to minimize token usage.
+    Use local_ticket_get() to fetch full details for a specific ticket.
+    """
+    return {
+        "id": ticket.id[:8],  # Short ID for display
+        "full_id": ticket.id,  # Full ID for lookups
+        "title": ticket.title[:80] + "..." if len(ticket.title) > 80 else ticket.title,
+        "status": ticket.status,
+        "priority": ticket.priority,
+        "tags": ticket.tags[:3] if ticket.tags else [],  # Max 3 tags
+        "parent_ticket": ticket.linked_ticket_id,  # Just the ID, not nested
     }
 
 
@@ -525,57 +713,136 @@ def list_tickets(
     label: Optional[str] = None,
     priority: Optional[int] = None,
     limit: int = 20,
+    offset: int = 0,
     path: Optional[str] = None,
     aggregate: bool = False,
+    source: Optional[str] = None,
 ) -> dict:
-    """List tickets with optional filtering.
+    """List ALL tickets - both from Linear and local storage.
+
+    Returns MINIMAL summary (~40 tokens/ticket). No descriptions included.
+    Use get_ticket(identifier) to fetch full details including description.
 
     Args:
-        state: Filter by state (Backlog, Todo, In Progress, In Review, Done)
-        label: Filter by label name
+        state: Filter by state (Backlog, Todo, In Progress, In Review, Done, pending, in_progress, completed)
+        label: Filter by label name (Linear tickets only)
         priority: Filter by priority (1=Urgent, 2=High, 3=Medium, 4=Low)
-        limit: Maximum tickets to return (default 20)
+        limit: Maximum tickets to return (default 20, max 100)
+        offset: Skip first N tickets for pagination (default 0)
         path: Directory to get context from (defaults to current directory)
-        aggregate: If True, scan for all .pm/ configs and aggregate tickets across
-                  all configured teams/projects, deduping when they share the same project.
+        aggregate: If True, scan for all .pm/ configs and aggregate tickets
+        source: Filter by source ('linear', 'local', or None for both)
 
-    Returns list of tickets matching criteria.
+    Returns list of tickets with pagination info.
     """
     if aggregate:
         return _list_tickets_aggregated(state, label, priority, limit, path)
 
-    client, context, error = _get_client_safe(path)
-    if error:
-        return error
+    all_tickets = []
 
-    if not client.config.team_id:
-        return {"error": "No team configured."}
+    # Get local tickets from SQLite
+    if source != "linear":
+        try:
+            db, project_id, context = _get_db_for_path(path)
+            ticket_manager = LocalTicketManager(db, project_id)
 
-    issues = client.get_team_issues(client.config.team_id)
+            # Map state to local status if needed
+            local_status = None
+            if state:
+                state_lower = state.lower()
+                status_map = {
+                    "todo": "pending",
+                    "backlog": "pending",
+                    "in progress": "in_progress",
+                    "in review": "in_progress",
+                    "done": "completed",
+                }
+                local_status = status_map.get(state_lower, state_lower)
 
-    # Apply filters
-    if state:
-        issues = [i for i in issues if i["state"]["name"].lower() == state.lower()]
+            local_tickets = ticket_manager.list(
+                status=local_status,
+                include_completed=(state and state.lower() in ["done", "completed"]),
+            )
 
-    if label:
-        issues = [
-            i for i in issues
-            if any(l["name"].lower() == label.lower() for l in i.get("labels", {}).get("nodes", []))
-        ]
+            # Format local tickets to match Linear format
+            for t in local_tickets:
+                # Skip if priority filter doesn't match
+                if priority is not None and t.priority != priority:
+                    continue
 
-    if priority is not None:
-        issues = [i for i in issues if i.get("priority") == priority]
+                all_tickets.append({
+                    "identifier": t.id[:8],  # Short ID for display
+                    "id": t.id,
+                    "title": t.title,
+                    "state": _local_status_to_state(t.status),
+                    "priority": t.priority,
+                    "source": "local",
+                    "tags": t.tags,
+                })
+        except Exception:
+            pass  # Continue even if local DB fails
 
-    # Sort by priority then by identifier
-    issues = sorted(issues, key=lambda i: (i.get("priority", 4), i["identifier"]))
+    # Get Linear tickets if configured
+    if source != "local":
+        try:
+            client, context, error = _get_client_safe(path)
+            if not error and client.config.team_id:
+                issues = client.get_team_issues(client.config.team_id)
 
-    # Limit results
-    issues = issues[:limit]
+                # Apply filters
+                if state:
+                    issues = [i for i in issues if i["state"]["name"].lower() == state.lower()]
+
+                if label:
+                    issues = [
+                        i for i in issues
+                        if any(l["name"].lower() == label.lower() for l in i.get("labels", {}).get("nodes", []))
+                    ]
+
+                if priority is not None:
+                    issues = [i for i in issues if i.get("priority") == priority]
+
+                # Add Linear tickets
+                for i in issues:
+                    formatted = _format_issue_summary(i)
+                    formatted["source"] = "linear"
+                    all_tickets.append(formatted)
+        except Exception:
+            pass  # Continue even if Linear fails
+
+    # Sort by priority (highest first) then by identifier
+    all_tickets = sorted(all_tickets, key=lambda t: (-(t.get("priority") or 0), t.get("identifier", "")))
+
+    # Apply pagination
+    limit = min(limit, 100)  # Cap at 100
+    total_count = len(all_tickets)
+    paginated_tickets = all_tickets[offset:offset + limit]
+    has_more = (offset + limit) < total_count
 
     return {
-        "tickets": [_format_issue_summary(i) for i in issues],
-        "count": len(issues),
+        "tickets": paginated_tickets,
+        "pagination": {
+            "total_count": total_count,
+            "showing": len(paginated_tickets),
+            "offset": offset,
+            "limit": limit,
+            "has_more": has_more,
+            "next_offset": offset + limit if has_more else None,
+        },
     }
+
+
+def _local_status_to_state(status: str) -> str:
+    """Convert local ticket status to display state."""
+    status_map = {
+        "pending": "Todo",
+        "in_progress": "In Progress",
+        "completed": "Done",
+        "blocked": "Blocked",
+        "canceled": "Canceled",
+        "orphaned": "Orphaned",
+    }
+    return status_map.get(status, status.title())
 
 
 def _list_tickets_aggregated(
@@ -872,6 +1139,547 @@ def get_related_tickets(
         "related": get_relation_details("related"),
         "parent": parent_info,
         "sub_issues": sub_list,
+    }
+
+
+# ============================================================================
+# Local Tickets MCP Tools
+# ============================================================================
+
+
+@mcp.tool()
+def local_ticket_create(
+    title: str,
+    description: Optional[str] = None,
+    parent_ticket_id: Optional[str] = None,
+    priority: int = 2,
+    tags: Optional[list[str]] = None,
+    status: str = "pending",
+    blocks: Optional[list[str]] = None,
+    blocked_by: Optional[list[str]] = None,
+    path: Optional[str] = None,
+) -> dict:
+    """Create a local ticket for tracking work.
+
+    Local tickets are stored locally and work fully offline.
+    They can optionally be linked to a parent Linear ticket.
+
+    Args:
+        title: Ticket title (what needs to be done)
+        description: Optional detailed description
+        parent_ticket_id: Parent Linear ticket to link (e.g., "SEM-123")
+        priority: 0-4, higher = more important (default 2)
+        tags: Optional list of tags for categorization
+        status: Initial status (pending, in_progress, blocked) - default 'pending'
+        blocks: List of ticket IDs this ticket blocks
+        blocked_by: List of ticket IDs that block this ticket
+        path: Directory to get context from (defaults to current directory)
+
+    Returns created ticket with any linked parent ticket info.
+
+    Example workflow:
+    1. Get parent ticket requirements: get_ticket("SEM-45")
+    2. Create sub-tickets:
+       - local_ticket_create("Implement JWT validation", parent_ticket_id="SEM-45")
+       - local_ticket_create("Add refresh token logic", parent_ticket_id="SEM-45", blocked_by=[ticket1_id])
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    # Link to external item if parent_ticket_id provided
+    external_item_id = None
+    if parent_ticket_id:
+        external_item_id = _cache_external_item(db, project_id, parent_ticket_id, path)
+        if not external_item_id:
+            return {
+                "error": "ticket_not_found",
+                "message": f"Could not find or cache parent ticket: {parent_ticket_id}",
+            }
+
+    # Create the ticket
+    ticket_manager = LocalTicketManager(db, project_id)
+    ticket = ticket_manager.create(
+        title=title,
+        description=description,
+        parent_ticket_id=external_item_id,
+        priority=priority,
+        tags=tags,
+        status=status,
+    )
+
+    # Add dependencies if specified
+    dep_manager = DependencyManager(db, project_id)
+
+    if blocks:
+        for target_id in blocks:
+            dep_manager.add(
+                source_id=ticket.id,
+                target_id=target_id,
+                relation="blocks",
+                source_type="local",
+                target_type="local",
+            )
+
+    if blocked_by:
+        for source_id in blocked_by:
+            dep_manager.add(
+                source_id=source_id,
+                target_id=ticket.id,
+                relation="blocks",
+                source_type="local",
+                target_type="local",
+            )
+
+    # Re-fetch to get full denormalized data
+    ticket = ticket_manager.get(ticket.id)
+
+    return {
+        "success": True,
+        "ticket": _format_local_ticket(ticket),
+    }
+
+
+@mcp.tool()
+def local_ticket_update(
+    ticket_id: str,
+    title: Optional[str] = None,
+    description: Optional[str] = None,
+    status: Optional[str] = None,
+    priority: Optional[int] = None,
+    tags: Optional[list[str]] = None,
+    parent_ticket_id: Optional[str] = None,
+    path: Optional[str] = None,
+) -> dict:
+    """Update a local ticket.
+
+    Args:
+        ticket_id: Ticket UUID to update
+        title: New title
+        description: New description
+        status: New status (pending, in_progress, completed, blocked, canceled)
+        priority: New priority (0-4)
+        tags: New tags list (replaces existing)
+        parent_ticket_id: Link to different parent ticket (or empty string to unlink)
+        path: Directory to get context from (defaults to current directory)
+
+    Returns updated ticket or error.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    ticket_manager = LocalTicketManager(db, project_id)
+
+    # Check ticket exists
+    existing = ticket_manager.get(ticket_id)
+    if not existing:
+        return {"error": "not_found", "message": f"Ticket not found: {ticket_id}"}
+
+    # Handle parent ticket linking
+    external_item_id = None
+    if parent_ticket_id is not None:
+        if parent_ticket_id == "":
+            external_item_id = ""  # Signal to unlink
+        else:
+            external_item_id = _cache_external_item(db, project_id, parent_ticket_id, path)
+            if not external_item_id:
+                return {
+                    "error": "ticket_not_found",
+                    "message": f"Could not find or cache parent ticket: {parent_ticket_id}",
+                }
+
+    # Update the ticket
+    ticket = ticket_manager.update(
+        ticket_id=ticket_id,
+        title=title,
+        description=description,
+        status=status,
+        priority=priority,
+        tags=tags,
+        parent_ticket_id=external_item_id,
+    )
+
+    return {
+        "success": True,
+        "ticket": _format_local_ticket(ticket),
+    }
+
+
+@mcp.tool()
+def local_ticket_list(
+    parent_ticket_id: Optional[str] = None,
+    epic_id: Optional[str] = None,
+    status: Optional[str] = None,
+    include_completed: bool = False,
+    limit: int = 20,
+    offset: int = 0,
+    path: Optional[str] = None,
+) -> dict:
+    """List local tickets with optional filtering.
+
+    Returns MINIMAL summary by default (~25 tokens/ticket vs ~100+ with full details).
+    Use local_ticket_get(ticket_id) to fetch full details including description.
+
+    Args:
+        parent_ticket_id: Filter by parent ticket (e.g., "SEM-123")
+        epic_id: Filter by epic - shows tickets across ALL parent tickets in that epic!
+        status: Filter by status (pending, in_progress, completed, blocked, canceled, orphaned)
+        include_completed: Include completed/canceled/orphaned tickets (default False)
+        limit: Maximum tickets to return (default 20, max 100)
+        offset: Skip first N tickets for pagination (default 0)
+        path: Directory to get context from (defaults to current directory)
+
+    Returns list of tickets sorted by priority (highest first), then order.
+    Includes pagination info: total_count, has_more, next_offset.
+
+    Epic grouping is powerful: when working on related parent tickets in the same epic,
+    you can see all sub-tickets across those parent tickets with epic_id filter.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    ticket_manager = LocalTicketManager(db, project_id)
+
+    # Resolve parent_ticket_id to internal UUID if provided
+    external_item_id = None
+    if parent_ticket_id:
+        ext_manager = ExternalItemsManager(db, project_id)
+        external_item_id = ext_manager.get_uuid_for_provider_id(parent_ticket_id)
+        if not external_item_id:
+            # Try caching first
+            external_item_id = _cache_external_item(db, project_id, parent_ticket_id, path)
+
+    # Fetch all matching tickets (we'll paginate in memory for now)
+    all_tickets = ticket_manager.list(
+        parent_ticket_id=external_item_id,
+        epic_id=epic_id,
+        status=status,
+        include_completed=include_completed,
+    )
+
+    # Apply pagination
+    limit = min(limit, 100)  # Cap at 100
+    total_count = len(all_tickets)
+    paginated_tickets = all_tickets[offset:offset + limit]
+    has_more = (offset + limit) < total_count
+
+    return {
+        "tickets": [_format_local_ticket_summary(t) for t in paginated_tickets],
+        "pagination": {
+            "total_count": total_count,
+            "showing": len(paginated_tickets),
+            "offset": offset,
+            "limit": limit,
+            "has_more": has_more,
+            "next_offset": offset + limit if has_more else None,
+        },
+    }
+
+
+@mcp.tool()
+def local_ticket_get(ticket_id: str, path: Optional[str] = None) -> dict:
+    """Get full details for a single local ticket including description.
+
+    Use this to fetch complete ticket information when you need it.
+    For listing multiple tickets, use local_ticket_list() which returns minimal summaries.
+
+    Args:
+        ticket_id: Ticket UUID (full or short 8-char prefix)
+        path: Directory to get context from (defaults to current directory)
+
+    Returns complete ticket with description, timestamps, parent ticket details.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    ticket_manager = LocalTicketManager(db, project_id)
+
+    # Support short ID lookup (first 8 chars)
+    ticket = ticket_manager.get(ticket_id)
+    if not ticket and len(ticket_id) == 8:
+        # Try to find by prefix
+        all_tickets = ticket_manager.list(include_completed=True)
+        matches = [t for t in all_tickets if t.id.startswith(ticket_id)]
+        if len(matches) == 1:
+            ticket = matches[0]
+        elif len(matches) > 1:
+            return {
+                "error": "ambiguous_id",
+                "message": f"Multiple tickets match prefix '{ticket_id}'",
+                "matches": [{"id": t.id, "title": t.title} for t in matches],
+            }
+
+    if not ticket:
+        return {"error": "not_found", "message": f"Ticket not found: {ticket_id}"}
+
+    return {"ticket": _format_local_ticket(ticket)}
+
+
+@mcp.tool()
+def local_ticket_delete(ticket_id: str, path: Optional[str] = None) -> dict:
+    """Delete a local ticket.
+
+    Also removes any dependencies involving this ticket.
+
+    Args:
+        ticket_id: Ticket UUID to delete
+        path: Directory to get context from (defaults to current directory)
+
+    Returns success or error.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    ticket_manager = LocalTicketManager(db, project_id)
+
+    # Check ticket exists
+    existing = ticket_manager.get(ticket_id)
+    if not existing:
+        return {"error": "not_found", "message": f"Ticket not found: {ticket_id}"}
+
+    # Delete (cascades to dependencies)
+    deleted = ticket_manager.delete(ticket_id)
+
+    return {
+        "success": deleted,
+        "deleted_ticket_id": ticket_id,
+        "deleted_title": existing.title,
+    }
+
+
+# ============================================================================
+# Dependency Management MCP Tools
+# ============================================================================
+
+
+@mcp.tool()
+def dependency_add(
+    source_id: str,
+    target_id: str,
+    relation: str = "blocks",
+    source_type: str = "local",
+    target_type: str = "local",
+    notes: Optional[str] = None,
+    path: Optional[str] = None,
+) -> dict:
+    """Add a dependency relationship between items.
+
+    For 'blocks' relation: source blocks target (target can't start until source is done).
+
+    Args:
+        source_id: ID of the blocking item (plan UUID or ticket provider ID)
+        target_id: ID of the blocked item
+        relation: "blocks" or "related_to" (default "blocks")
+        source_type: "local" (plan) or "external" (ticket) - default "local"
+        target_type: "local" (plan) or "external" (ticket) - default "local"
+        notes: Optional notes about the dependency
+        path: Directory to get context from (defaults to current directory)
+
+    Example: Plan B can't start until Plan A is done:
+        dependency_add(source_id=plan_a_id, target_id=plan_b_id, relation="blocks")
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    # Resolve external IDs if needed
+    if source_type == "external":
+        ext_manager = ExternalItemsManager(db, project_id)
+        uuid = ext_manager.get_uuid_for_provider_id(source_id)
+        if not uuid:
+            uuid = _cache_external_item(db, project_id, source_id, path)
+        if uuid:
+            source_id = uuid
+
+    if target_type == "external":
+        ext_manager = ExternalItemsManager(db, project_id)
+        uuid = ext_manager.get_uuid_for_provider_id(target_id)
+        if not uuid:
+            uuid = _cache_external_item(db, project_id, target_id, path)
+        if uuid:
+            target_id = uuid
+
+    dep_manager = DependencyManager(db, project_id)
+
+    dep = dep_manager.add(
+        source_id=source_id,
+        target_id=target_id,
+        relation=relation,
+        source_type=source_type,
+        target_type=target_type,
+        notes=notes,
+    )
+
+    return {
+        "success": True,
+        "dependency": {
+            "id": dep.id,
+            "source_id": dep.source_id,
+            "source_type": dep.source_type,
+            "target_id": dep.target_id,
+            "target_type": dep.target_type,
+            "relation": dep.relation,
+            "notes": dep.notes,
+        },
+    }
+
+
+@mcp.tool()
+def dependency_remove(
+    source_id: str,
+    target_id: str,
+    relation: Optional[str] = None,
+    source_type: str = "local",
+    target_type: str = "local",
+    path: Optional[str] = None,
+) -> dict:
+    """Remove a dependency relationship.
+
+    Args:
+        source_id: ID of the source item
+        target_id: ID of the target item
+        relation: Specific relation to remove, or all relations if None
+        source_type: "local" or "external" (default "local")
+        target_type: "local" or "external" (default "local")
+        path: Directory to get context from (defaults to current directory)
+
+    Returns count of removed dependencies.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    dep_manager = DependencyManager(db, project_id)
+
+    count = dep_manager.remove(
+        source_id=source_id,
+        target_id=target_id,
+        relation=relation,
+        source_type=source_type,
+        target_type=target_type,
+    )
+
+    return {
+        "success": True,
+        "removed_count": count,
+    }
+
+
+@mcp.tool()
+def get_blockers(
+    item_id: str,
+    item_type: str = "local",
+    recursive: bool = False,
+    include_resolved: bool = False,
+    path: Optional[str] = None,
+) -> dict:
+    """Get items blocking this one.
+
+    Args:
+        item_id: Plan UUID or ticket provider ID
+        item_type: "local" (plan) or "external" (ticket) - default "local"
+        recursive: Walk the full dependency tree (up to depth 10)
+        include_resolved: Include already completed/resolved blockers
+        path: Directory to get context from (defaults to current directory)
+
+    Returns list of blocking items with their status.
+    Useful to understand why an item can't be started.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    dep_manager = DependencyManager(db, project_id)
+
+    blockers = dep_manager.get_blockers(
+        item_id=item_id,
+        item_type=item_type,
+        recursive=recursive,
+        include_resolved=include_resolved,
+    )
+
+    formatted = [
+        {
+            "item_type": b.item_type,
+            "item_id": b.item_id,
+            "title": b.title,
+            "status": b.status,
+            "depth": b.depth,
+            "resolved": b.resolved,
+        }
+        for b in blockers
+    ]
+
+    unresolved_count = len([b for b in blockers if not b.resolved])
+
+    return {
+        "blockers": formatted,
+        "count": len(formatted),
+        "unresolved_count": unresolved_count,
+        "is_blocked": unresolved_count > 0,
+    }
+
+
+@mcp.tool()
+def get_ready_work(
+    include_local: bool = True,
+    limit: int = 5,
+    path: Optional[str] = None,
+) -> dict:
+    """Get unblocked items ready to work on.
+
+    An item is "ready" when:
+    - Status is pending or in_progress
+    - All blocking dependencies are resolved (completed/done/canceled)
+
+    Args:
+        include_local: Include local plans (default True)
+        limit: Maximum items to return (default 5)
+        path: Directory to get context from (defaults to current directory)
+
+    Returns items sorted by priority (highest first).
+    Use this to find what you can work on next!
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    dep_manager = DependencyManager(db, project_id)
+
+    ready = dep_manager.get_ready_work(
+        include_local=include_local,
+        limit=limit,
+    )
+
+    formatted = [
+        {
+            "item_type": r.item_type,
+            "item_id": r.item_id,
+            "title": r.title,
+            "status": r.status,
+            "priority": r.priority,
+            "linked_ticket_id": r.linked_ticket_id,
+            "linked_epic_id": r.linked_epic_id,
+        }
+        for r in ready
+    ]
+
+    return {
+        "ready_items": formatted,
+        "count": len(formatted),
     }
 
 

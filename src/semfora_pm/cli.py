@@ -68,6 +68,32 @@ def get_client(path: Optional[Path] = None) -> LinearClient:
 
 
 # ============================================================================
+# TUI Command
+# ============================================================================
+
+
+@app.command("tui")
+def launch_tui(
+    path: Optional[Path] = typer.Option(None, "--path", "-p", help="Directory for PM context"),
+):
+    """Launch the interactive Terminal User Interface.
+
+    Provides a rich terminal interface for managing local plans,
+    viewing dependencies, and interacting with connected providers.
+
+    Key bindings:
+    - d: Dashboard view
+    - p: Plans list
+    - g: Dependency graph
+    - n: New plan
+    - q: Quit
+    """
+    from .tui import run_tui
+
+    run_tui(path)
+
+
+# ============================================================================
 # Context Commands
 # ============================================================================
 
