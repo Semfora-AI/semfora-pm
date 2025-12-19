@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Semfora PM data (user-specific, should not be committed)
+.pm/cache.db
+.pm/cachedb
+.pm/memory.json
+.pm/plans/
+.pm/tickets/
+.pm/dependencies/
+
+# User ticket data
+tickets/
+
+# Keep config.yaml as it may be a template
+!.pm/config.yaml.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test/dev files
+*.log
+.coverage
+htmlcov/
+.pytest_cache/
