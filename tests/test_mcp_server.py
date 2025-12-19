@@ -143,9 +143,14 @@ class TestGetTicketSummary:
 class TestGetTicket:
     """Tests for existing get_ticket MCP tool."""
 
+    @pytest.mark.asyncio
+    @patch("semfora_pm.mcp_server._ensure_roots_initialized")
     @patch("semfora_pm.mcp_server._get_client_safe")
-    def test_returns_full_data(self, mock_get_client):
+    async def test_returns_full_data(self, mock_get_client, mock_ensure_roots):
         """Should return complete ticket info including description."""
+        # Mock async _ensure_roots_initialized
+        mock_ensure_roots.return_value = None
+
         mock_client = Mock()
         mock_client.get_issue_full.return_value = {
             "identifier": "SEM-45",
@@ -168,7 +173,9 @@ class TestGetTicket:
         mock_context = Mock()
         mock_get_client.return_value = (mock_client, mock_context, None)
 
-        result = get_ticket("SEM-45")
+        # Pass a mock MCP Context
+        mock_mcp_ctx = Mock()
+        result = await get_ticket(mock_mcp_ctx, "SEM-45")
 
         # Full ticket should include description
         assert "description" in result

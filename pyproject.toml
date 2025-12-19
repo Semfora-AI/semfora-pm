@@ -21,6 +21,7 @@ dependencies = [
     "mcp[cli]>=1.0.0",
     "platformdirs>=4.0",
     "textual>=0.47.0",
+    "toon-python>=0.1.0",
 ]
 
 [project.optional-dependencies]

@@ -6,10 +6,77 @@ enabling ticket-first development workflows.
 Supports directory-based configuration via .pm/config.yaml files.
 """
 
+import asyncio
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Context
+
+# ============================================================================
+# Client CWD Detection via MCP Roots
+# ============================================================================
+# The MCP server's cwd is where the Python module runs, NOT the user's cwd.
+# We use MCP's list_roots() to get the client's (Claude Code's) workspace roots.
+
+_client_cwd: Optional[Path] = None
+_roots_initialized: bool = False
+_roots_lock: Optional[asyncio.Lock] = None
+
+
+def _get_roots_lock() -> asyncio.Lock:
+    """Get or create the roots lock (lazy init for thread safety)."""
+    global _roots_lock
+    if _roots_lock is None:
+        _roots_lock = asyncio.Lock()
+    return _roots_lock
+
+
+async def _ensure_roots_initialized(ctx: "Context") -> None:
+    """Lazily fetch and cache client roots on first tool call.
+
+    This is called by async tools to initialize the client's working directory
+    from MCP roots. The result is cached globally for all subsequent calls.
+    """
+    global _client_cwd, _roots_initialized
+
+    if _roots_initialized:
+        return
+
+    async with _get_roots_lock():
+        # Double-check after acquiring lock
+        if _roots_initialized:
+            return
+
+        try:
+            result = await ctx.session.list_roots()
+            if result.roots:
+                # Take the first root as the default working directory
+                uri = str(result.roots[0].uri)
+                # FileUrl format: file:///path/to/dir
+                if uri.startswith("file://"):
+                    # Handle both file:// and file:/// formats
+                    path_str = uri.replace("file://", "")
+                    _client_cwd = Path(path_str)
+                elif uri.startswith("/"):
+                    _client_cwd = Path(uri)
+        except Exception:
+            # list_roots might not be supported by the client
+            pass
+        finally:
+            _roots_initialized = True
+
+
+def _get_effective_path(path: Optional[str]) -> Optional[Path]:
+    """Get effective path using cached client roots or explicit path.
+
+    Priority:
+    1. Explicit path parameter (if provided)
+    2. Cached client CWD from MCP roots (if initialized)
+    3. None (caller should fall back to Path.cwd())
+    """
+    if path:
+        return Path(path)
+    return _client_cwd
 
 from .linear_client import AuthenticationError, LinearClient, LinearConfig
 from .pm_config import (
@@ -27,35 +94,115 @@ from .external_items import (
     normalize_linear_status,
     normalize_linear_priority,
 )
+# Plans-as-Memory architecture imports
+from .plans import PlanManager, PlanSummary
+from .memory import MemoryManager, ProjectMemory
+from .session import SessionManager, SessionContext
+from .tickets import TicketManager, Ticket, TicketSummary
+from .toon import Plan, serialize as toon_serialize, get_progress_summary
 
 # Create the MCP server
 mcp = FastMCP(
     "semfora-pm",
-    instructions="""Semfora PM - Linear Ticket Management
+    instructions="""Semfora PM - Plans-as-Memory Architecture
 
-This server provides access to Linear tickets for project management.
+## Core Concepts
+- **Ticket** = WHAT needs doing (unified: local or Linear)
+- **Plan** = HOW to do it (steps, ACs, tools, files)
+- **Memory** = Condensed context across sessions
 
-DIRECTORY-BASED CONFIGURATION:
-- Uses .pm/config.yaml to configure team/project per directory
-- Automatically detects config from current directory or parents
-- Falls back to user config (~/.config/semfora-pm/config.json)
-- Use scan_pm_dirs to discover all configured directories
+## Quick Reference
 
-MULTI-REPO SUPPORT:
-- Each tool accepts --path to target a specific directory
-- Use detect_pm_context to see which team/project is configured
-- Different directories can use different Linear teams/projects
+| Goal | Tool | Notes |
+|------|------|-------|
+| **Find work** | `search("query")` | 🔍 Searches plans + local + Linear in ONE call |
+| Start work | `session_start` | Loads memory, finds plans |
+| Resume work | `session_continue` | Returns to last active plan |
+| Create plan | `plan_create` | Auto-activates by default |
+| Complete step | `plan_step_complete(index)` | 1-based index |
+| Quick fix | `quick_fix_note` | No plan needed |
+| What next? | `suggest_next_work` | Priority-sorted |
+| End session | `session_end` | Condenses memory |
 
-WORKFLOW:
-1. Use scan_pm_dirs to discover configured directories
-2. Use detect_pm_context to verify team/project for a path
-3. Use sprint_status to check active tickets
-4. Use get_ticket to get full requirements before implementing
-5. Use update_ticket_status as you work
+## Unified Search (USE THIS)
 
-IMPORTANT: All development work should be associated with a ticket.
-Before implementing any feature or fix, always verify the ticket exists
-and review its full requirements."""
+**`search()` is the ONE tool for finding work:**
+
+```
+search("auth")                           # Find all auth-related work
+search("bug", status="open")             # Open bugs only
+search("", source="local")               # All local work
+search("", status="active")              # What's in progress now?
+search("", tags=["critical"])            # Critical items
+search("windows", source="local")        # Local Windows work only
+```
+
+**Returns grouped results:** plans (HOW) → local_tickets (WHAT) → linear_tickets (external)
+
+**Status options:** "open" (default), "closed", "active", "all"
+**Source options:** None (all), "local", "linear"
+**Sort options:** "priority" (default), "updated", "created"
+
+## Workflow Patterns
+
+### New Feature (no ticket)
+```
+session_start() → unified_ticket_create() → plan_create() → work → session_end()
+```
+
+### Continue Existing Work
+```
+session_continue() → [plan shows current step] → plan_step_complete() → ...
+```
+
+### Quick Ad-Hoc Fix
+```
+quick_fix_note("Fixed null pointer in LoginForm")
+```
+Or if scope grows: `plan_create()` then `plan_update(ticket_id=...)` later.
+
+### "What Should I Work On?"
+```
+suggest_next_work() → returns blocked/ready/recommended
+```
+
+### Save Plan for Later (Don't Activate)
+```
+local_ticket_create(title, description) → plan_create(..., activate=False)
+```
+Creates ticket and plan as DRAFT. Won't become active or interrupt current work.
+Use `plan_activate(plan_id)` later when ready to start.
+
+## Pagination (IMPORTANT)
+List tools return `pagination: {has_more, next_offset}`.
+To get more: call again with `offset=next_offset`.
+Example: `list_tickets(offset=20, limit=20)`
+
+## When to Fetch What
+
+**Use the PLAN (not ticket) when:**
+- Resuming work (`session_continue` gives you the active plan)
+- Working through steps (plan has steps, ACs, tools, files)
+- Checking progress (plan tracks completed/pending steps)
+
+**Fetch full TICKET only when:**
+- Starting work on a NEW ticket for the first time
+- Requirements are unclear and you need the original description
+- Plan doesn't exist yet and you need to create one
+
+**Rule of thumb:** If a plan exists, trust the plan. The plan was created
+FROM the ticket and contains everything needed to execute.
+
+## Token Efficiency
+- List tools return MINIMAL summaries (~30 tokens/item)
+- `session_continue` returns current plan in TOON format - use this!
+- Only call `get_ticket` when starting fresh or requirements unclear
+- Plans in TOON format are already token-optimized (~70% smaller)
+
+## Config
+- Uses `.pm/config.yaml` per directory
+- `detect_pm_context` shows active config
+- `scan_pm_dirs` finds all configs in tree"""
 )
 
 
@@ -65,7 +212,8 @@ def _get_client_for_path(path: Optional[str] = None) -> tuple[LinearClient, PMCo
     Returns (client, context) tuple.
     Raises AuthenticationError if not configured.
     """
-    path_obj = Path(path) if path else None
+    # Use effective path (explicit > cached client roots > None)
+    path_obj = _get_effective_path(path)
     context = resolve_context(path_obj)
 
     if not context.api_key:
@@ -105,6 +253,65 @@ def _get_client_safe(path: Optional[str] = None) -> tuple[Optional[LinearClient]
         }
 
 
+# ============================================================================
+# Token Efficiency Helpers
+# ============================================================================
+
+# Maximum characters for description fields in list responses
+MAX_DESCRIPTION_LENGTH = 500
+# Maximum characters for a single plan step
+MAX_STEP_LENGTH = 300
+# Recommended step length for best token efficiency
+RECOMMENDED_STEP_LENGTH = 150
+
+
+def _truncate(text: Optional[str], max_length: int = MAX_DESCRIPTION_LENGTH) -> Optional[str]:
+    """Truncate text with indicator if too long."""
+    if not text:
+        return text
+    if len(text) <= max_length:
+        return text
+    return text[:max_length - 3] + "..."
+
+
+def _truncate_with_hint(text: Optional[str], max_length: int, hint: str) -> tuple[Optional[str], Optional[str]]:
+    """Truncate text and return (truncated_text, hint_if_truncated)."""
+    if not text or len(text) <= max_length:
+        return text, None
+    return text[:max_length - 3] + "...", hint
+
+
+def _pagination_hint(has_more: bool, next_offset: Optional[int], tool_name: str) -> Optional[str]:
+    """Generate pagination hint for list responses."""
+    if not has_more:
+        return None
+    return f"More results available. Call {tool_name}(offset={next_offset}) to get next page."
+
+
+def _validate_steps(steps: Optional[list[str]]) -> tuple[list[str], list[str]]:
+    """Validate step lengths and return (steps, warnings).
+
+    Returns the steps (possibly unchanged) and any warnings about length.
+    Long steps are NOT rejected - just warned about.
+    """
+    if not steps:
+        return [], []
+
+    warnings = []
+    for i, step in enumerate(steps):
+        if len(step) > MAX_STEP_LENGTH:
+            warnings.append(
+                f"Step {i+1} is {len(step)} chars (recommended max: {RECOMMENDED_STEP_LENGTH}). "
+                f"Consider breaking into smaller steps for better tracking."
+            )
+        elif len(step) > RECOMMENDED_STEP_LENGTH:
+            warnings.append(
+                f"Step {i+1} is {len(step)} chars. Steps under {RECOMMENDED_STEP_LENGTH} chars work best."
+            )
+
+    return steps, warnings
+
+
 def _format_priority(priority: int) -> str:
     """Convert priority number to string."""
     return {0: "None", 1: "Urgent", 2: "High", 3: "Medium", 4: "Low"}.get(priority, str(priority))
@@ -135,7 +342,8 @@ def _get_db_for_path(path: Optional[str] = None) -> tuple[Database, str, PMConte
     Returns (db, project_id, context) tuple.
     Creates project record if needed.
     """
-    path_obj = Path(path) if path else None
+    # Use effective path (explicit > cached client roots > None)
+    path_obj = _get_effective_path(path)
     context = resolve_context(path_obj)
 
     db = Database(context.get_db_path())
@@ -346,7 +554,7 @@ def scan_pm_dirs(
 
 
 @mcp.tool()
-def detect_pm_context(path: Optional[str] = None) -> dict:
+async def detect_pm_context(ctx: Context, path: Optional[str] = None) -> dict:
     """Detect PM context for a path.
 
     Args:
@@ -362,7 +570,10 @@ def detect_pm_context(path: Optional[str] = None) -> dict:
 
     Use this to verify which team/project will be used for a directory.
     """
-    path_obj = Path(path) if path else None
+    # Initialize client CWD from MCP roots on first call
+    await _ensure_roots_initialized(ctx)
+
+    path_obj = _get_effective_path(path)
     context = resolve_context(path_obj)
 
     return {
@@ -420,7 +631,7 @@ def check_auth(path: Optional[str] = None) -> dict:
 
 
 @mcp.tool()
-def sprint_status(path: Optional[str] = None, aggregate: bool = False) -> dict:
+async def sprint_status(ctx: Context, path: Optional[str] = None, aggregate: bool = False) -> dict:
     """Get current sprint status showing all active tickets.
 
     Args:
@@ -432,6 +643,9 @@ def sprint_status(path: Optional[str] = None, aggregate: bool = False) -> dict:
     Returns tickets grouped by state: In Progress, In Review, and Todo.
     Use this FIRST before starting any work to see what's currently active.
     """
+    # Initialize client CWD from MCP roots on first call
+    await _ensure_roots_initialized(ctx)
+
     if aggregate:
         return _sprint_status_aggregated(path)
 
@@ -570,7 +784,7 @@ def _sprint_status_aggregated(base_path: Optional[str] = None) -> dict:
 
 
 @mcp.tool()
-def get_ticket(identifier: str, path: Optional[str] = None) -> dict:
+async def get_ticket(ctx: Context, identifier: str, path: Optional[str] = None) -> dict:
     """Get full details for a specific ticket.
 
     Args:
@@ -586,6 +800,7 @@ def get_ticket(identifier: str, path: Optional[str] = None) -> dict:
 
     ALWAYS use this before implementing a ticket to get full requirements.
     """
+    await _ensure_roots_initialized(ctx)
     client, context, error = _get_client_safe(path)
     if error:
         return error
@@ -708,7 +923,8 @@ def get_ticket_summary(identifier: str, path: Optional[str] = None) -> dict:
 
 
 @mcp.tool()
-def list_tickets(
+async def list_tickets(
+    ctx: Context,
     state: Optional[str] = None,
     label: Optional[str] = None,
     priority: Optional[int] = None,
@@ -735,6 +951,7 @@ def list_tickets(
 
     Returns list of tickets with pagination info.
     """
+    await _ensure_roots_initialized(ctx)
     if aggregate:
         return _list_tickets_aggregated(state, label, priority, limit, path)
 
@@ -819,7 +1036,7 @@ def list_tickets(
     paginated_tickets = all_tickets[offset:offset + limit]
     has_more = (offset + limit) < total_count
 
-    return {
+    result = {
         "tickets": paginated_tickets,
         "pagination": {
             "total_count": total_count,
@@ -830,6 +1047,13 @@ def list_tickets(
             "next_offset": offset + limit if has_more else None,
         },
     }
+
+    # Add pagination hint for AI
+    hint = _pagination_hint(has_more, offset + limit if has_more else None, "list_tickets")
+    if hint:
+        result["_hint"] = hint
+
+    return result
 
 
 def _local_status_to_state(status: str) -> str:
@@ -985,12 +1209,266 @@ def sprint_suggest(
 
 
 @mcp.tool()
+async def search(
+    ctx: Context,
+    query: str,
+    source: Optional[str] = None,
+    status: Optional[str] = None,
+    sort_by: str = "priority",
+    tags: Optional[list[str]] = None,
+    limit: int = 10,
+    offset: int = 0,
+    path: Optional[str] = None,
+) -> dict:
+    """🔍 UNIFIED SEARCH: Search plans, local tickets, AND Linear tickets.
+
+    Searches EVERYTHING by default - one tool to find all work items.
+    Results are grouped by type: plans first (HOW), then tickets (WHAT).
+
+    Args:
+        query: Search text to match against title and description
+        source: Filter by source - "local", "linear", or None for ALL (default)
+        status: Filter by status:
+            - "open" (default): Active/pending/in-progress items
+            - "closed": Completed/canceled/abandoned items
+            - "active": Currently being worked on (in_progress, active)
+            - "all": Everything regardless of status
+        sort_by: "priority" (default), "updated", or "created"
+        tags: Filter by tags (local items only)
+        limit: Max results per category (default 10)
+        offset: Skip first N results for pagination (default 0)
+        path: Directory to get context from (defaults to current directory)
+
+    Returns grouped results:
+        - plans: Implementation plans (HOW to do work)
+        - local_tickets: Local tickets (WHAT to do)
+        - linear_tickets: Linear tickets (external requirements)
+        - pagination: {has_more, next_offset}
+
+    Examples:
+        search("auth")  # Find all auth-related work
+        search("bug", status="open")  # Open bugs only
+        search("", source="local", status="active")  # What am I working on now?
+        search("", tags=["critical"])  # All critical items
+    """
+    # Initialize client CWD from MCP roots on first call
+    await _ensure_roots_initialized(ctx)
+
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    # Normalize status filter
+    status = status or "open"
+    status_filters = {
+        "open": {
+            "plans": ["draft", "active", "paused"],
+            "local": ["pending", "in_progress", "blocked"],
+            "linear": ["Backlog", "Todo", "In Progress", "In Review"],
+        },
+        "closed": {
+            "plans": ["completed", "abandoned"],
+            "local": ["completed", "canceled", "orphaned"],
+            "linear": ["Done", "Canceled"],
+        },
+        "active": {
+            "plans": ["active"],
+            "local": ["in_progress"],
+            "linear": ["In Progress"],
+        },
+        "all": {
+            "plans": None,  # No filter
+            "local": None,
+            "linear": None,
+        },
+    }
+
+    if status not in status_filters:
+        return {"error": "invalid_status", "message": f"status must be one of: open, closed, active, all"}
+
+    filters = status_filters[status]
+    results = {
+        "plans": [],
+        "local_tickets": [],
+        "linear_tickets": [],
+        "query": query,
+        "filters": {"source": source or "all", "status": status, "sort_by": sort_by},
+    }
+
+    search_pattern = f"%{query}%" if query else "%"
+
+    # === SEARCH PLANS ===
+    if source in (None, "local"):
+        plan_mgr = PlanManager(db, project_id)
+
+        # Build status filter for plans
+        plan_status_filter = filters["plans"]
+
+        # Use plan search if we have a query, otherwise list
+        if query:
+            plan_results = plan_mgr.search(query, limit=limit + offset)
+        else:
+            plan_results = plan_mgr.list(status=None, limit=limit + offset)
+
+        # Filter by status if needed
+        if plan_status_filter:
+            plan_results = [p for p in plan_results if p.status in plan_status_filter]
+
+        # Apply offset and limit
+        plan_results = plan_results[offset:offset + limit]
+
+        # Sort
+        if sort_by == "priority":
+            # Plans don't have priority, sort by status (active first)
+            status_order = {"active": 0, "paused": 1, "draft": 2, "completed": 3, "abandoned": 4}
+            plan_results.sort(key=lambda p: status_order.get(p.status, 5))
+        elif sort_by == "updated":
+            plan_results.sort(key=lambda p: p.updated_at or "", reverse=True)
+        elif sort_by == "created":
+            plan_results.sort(key=lambda p: p.created_at or "", reverse=True)
+
+        results["plans"] = [
+            {
+                "id": p.id,
+                "title": p.title,
+                "status": p.status,
+                "ticket_id": p.ticket_id,
+                "completed_steps": p.completed_steps,
+                "step_count": p.step_count,
+                "_type": "plan",
+            }
+            for p in plan_results
+        ]
+
+    # === SEARCH LOCAL TICKETS ===
+    if source in (None, "local"):
+        local_status_filter = filters["local"]
+
+        # Build query
+        sql = """
+            SELECT id, title, status, priority, tags, parent_ticket_id, updated_at, created_at
+            FROM local_tickets
+            WHERE project_id = ?
+              AND (title LIKE ? OR description LIKE ?)
+        """
+        params = [project_id, search_pattern, search_pattern]
+
+        if local_status_filter:
+            placeholders = ",".join("?" * len(local_status_filter))
+            sql += f" AND status IN ({placeholders})"
+            params.extend(local_status_filter)
+
+        if tags:
+            for tag in tags:
+                sql += " AND tags LIKE ?"
+                params.append(f"%{tag}%")
+
+        # Sort
+        if sort_by == "priority":
+            sql += " ORDER BY priority DESC, updated_at DESC"
+        elif sort_by == "updated":
+            sql += " ORDER BY updated_at DESC"
+        elif sort_by == "created":
+            sql += " ORDER BY created_at DESC"
+
+        sql += f" LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
+        with db.transaction() as conn:
+            rows = conn.execute(sql, params).fetchall()
+
+        results["local_tickets"] = [
+            {
+                "id": row[0][:8],
+                "full_id": row[0],
+                "title": row[1],
+                "status": row[2],
+                "priority": row[3],
+                "tags": row[4],
+                "parent_ticket_id": row[5],
+                "_type": "local_ticket",
+            }
+            for row in rows
+        ]
+
+    # === SEARCH LINEAR TICKETS ===
+    if source in (None, "linear"):
+        client, linear_context, error = _get_client_safe(path)
+        if not error and client:
+            try:
+                if query:
+                    linear_results = client.search_issues(query)
+                else:
+                    # Get recent issues if no query
+                    linear_results = client.get_team_issues(limit=limit + offset)
+
+                # Filter by status
+                linear_status_filter = filters["linear"]
+                if linear_status_filter:
+                    linear_results = [
+                        i for i in linear_results
+                        if i.get("state", {}).get("name") in linear_status_filter
+                    ]
+
+                # Apply offset and limit
+                linear_results = linear_results[offset:offset + limit]
+
+                # Sort by priority if requested
+                if sort_by == "priority":
+                    linear_results.sort(key=lambda i: i.get("priority") or 0, reverse=True)
+
+                results["linear_tickets"] = [
+                    {
+                        "id": i.get("identifier"),
+                        "title": i.get("title"),
+                        "status": i.get("state", {}).get("name"),
+                        "priority": i.get("priority"),
+                        "labels": [l.get("name") for l in i.get("labels", {}).get("nodes", [])],
+                        "_type": "linear_ticket",
+                    }
+                    for i in linear_results
+                ]
+            except Exception:
+                # Linear search failed, continue with local results
+                results["_linear_error"] = "Linear search unavailable"
+
+    # === PAGINATION ===
+    total_found = len(results["plans"]) + len(results["local_tickets"]) + len(results["linear_tickets"])
+    has_more = total_found == limit  # Approximate - at least one category hit limit
+    results["pagination"] = {
+        "offset": offset,
+        "limit": limit,
+        "has_more": has_more,
+        "next_offset": offset + limit if has_more else None,
+    }
+
+    # === HINT ===
+    if total_found == 0:
+        results["_hint"] = f"No results for '{query}'. Try status='all' or different query."
+    else:
+        type_counts = []
+        if results["plans"]:
+            type_counts.append(f"{len(results['plans'])} plans")
+        if results["local_tickets"]:
+            type_counts.append(f"{len(results['local_tickets'])} local tickets")
+        if results["linear_tickets"]:
+            type_counts.append(f"{len(results['linear_tickets'])} Linear tickets")
+        results["_hint"] = f"Found {', '.join(type_counts)}. Use plan_get/local_ticket_get/get_ticket for details."
+
+    return results
+
+
+@mcp.tool()
 def search_tickets(
     query: str,
     limit: int = 10,
     path: Optional[str] = None,
 ) -> dict:
     """Search for tickets by text query.
+
+    NOTE: Consider using search() instead - it searches plans, local tickets,
+    AND Linear tickets in one call with filtering options.
 
     Args:
         query: Search text to match against title and description
@@ -1309,7 +1787,8 @@ def local_ticket_update(
 
 
 @mcp.tool()
-def local_ticket_list(
+async def local_ticket_list(
+    ctx: Context,
     parent_ticket_id: Optional[str] = None,
     epic_id: Optional[str] = None,
     status: Optional[str] = None,
@@ -1338,6 +1817,7 @@ def local_ticket_list(
     Epic grouping is powerful: when working on related parent tickets in the same epic,
     you can see all sub-tickets across those parent tickets with epic_id filter.
     """
+    await _ensure_roots_initialized(ctx)
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
@@ -1368,7 +1848,7 @@ def local_ticket_list(
     paginated_tickets = all_tickets[offset:offset + limit]
     has_more = (offset + limit) < total_count
 
-    return {
+    result = {
         "tickets": [_format_local_ticket_summary(t) for t in paginated_tickets],
         "pagination": {
             "total_count": total_count,
@@ -1379,6 +1859,13 @@ def local_ticket_list(
             "next_offset": offset + limit if has_more else None,
         },
     }
+
+    # Add pagination hint for AI
+    hint = _pagination_hint(has_more, offset + limit if has_more else None, "local_ticket_list")
+    if hint:
+        result["_hint"] = hint
+
+    return result
 
 
 @mcp.tool()
@@ -1633,7 +2120,8 @@ def get_blockers(
 
 
 @mcp.tool()
-def get_ready_work(
+async def get_ready_work(
+    ctx: Context,
     include_local: bool = True,
     limit: int = 5,
     path: Optional[str] = None,
@@ -1652,6 +2140,7 @@ def get_ready_work(
     Returns items sorted by priority (highest first).
     Use this to find what you can work on next!
     """
+    await _ensure_roots_initialized(ctx)
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
@@ -1680,6 +2169,1244 @@ def get_ready_work(
     return {
         "ready_items": formatted,
         "count": len(formatted),
+    }
+
+
+# ============================================================================
+# Plans-as-Memory Architecture MCP Tools
+# ============================================================================
+
+
+# --- Session Management ---
+
+
+@mcp.tool()
+async def session_start(
+    mcp_ctx: Context,
+    ticket_id: Optional[str] = None,
+    query: Optional[str] = None,
+    path: Optional[str] = None,
+) -> dict:
+    """Start a new session and load memory context.
+
+    If ticket_id is provided, looks for plans related to that ticket.
+    If query is provided, searches for matching plans.
+    Otherwise, returns the current state from memory.
+
+    Args:
+        ticket_id: Optional ticket to work on (e.g., "SEM-45")
+        query: Optional search query for finding relevant plans
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        SessionContext with memory, current plan, matching plans, and suggestions.
+
+    Use this FIRST when starting work to understand the current state.
+    """
+    # Initialize client CWD from MCP roots on first call
+    await _ensure_roots_initialized(mcp_ctx)
+
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    session_mgr = SessionManager(db, project_id)
+    ctx = session_mgr.start(ticket_id=ticket_id, query=query)
+
+    # Format the response
+    result = {
+        "has_active_work": ctx.has_active_work,
+        "suggestions": ctx.suggestions,
+        "tools_available": ctx.tools_available,
+        "key_files": ctx.key_files,
+    }
+
+    # Memory summary
+    result["memory"] = {
+        "current_ticket_id": ctx.memory.current_ticket_id,
+        "current_ticket_title": ctx.memory.current_ticket_title,
+        "current_plan_id": ctx.memory.current_plan_id,
+        "current_plan_title": ctx.memory.current_plan_title,
+        "current_plan_status": ctx.memory.current_plan_status,
+        "current_step": ctx.memory.current_step,
+        "completed_steps": ctx.memory.completed_steps,
+        "total_steps": ctx.memory.total_steps,
+        "blockers": ctx.memory.blockers,
+        "discoveries_count": len(ctx.memory.discoveries),
+        "last_session": ctx.memory.last_session_end,
+    }
+
+    # Current plan if active
+    if ctx.current_plan:
+        progress = get_progress_summary(ctx.current_plan)
+        result["current_plan"] = {
+            "id": ctx.current_plan_id,
+            "title": ctx.current_plan.title,
+            "status": ctx.current_plan.status,
+            "progress": progress,
+            "toon": toon_serialize(ctx.current_plan),
+        }
+
+    # Matching plans
+    if ctx.matching_plans:
+        result["matching_plans"] = [
+            {
+                "id": p.id,
+                "title": p.title,
+                "status": p.status,
+                "ticket_id": p.ticket_id,
+                "steps_completed": p.steps_completed,
+                "steps_total": p.steps_total,
+            }
+            for p in ctx.matching_plans
+        ]
+
+    return result
+
+
+@mcp.tool()
+def session_continue(path: Optional[str] = None) -> dict:
+    """Continue from the last active plan.
+
+    This is the "continue" command - resume exactly where you left off.
+
+    Args:
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        SessionContext with the last active plan loaded.
+
+    Use this when resuming work after a break.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    session_mgr = SessionManager(db, project_id)
+    ctx = session_mgr.continue_session()
+
+    result = {
+        "has_active_work": ctx.has_active_work,
+        "suggestions": ctx.suggestions,
+    }
+
+    if ctx.current_plan:
+        progress = get_progress_summary(ctx.current_plan)
+        result["current_plan"] = {
+            "id": ctx.current_plan_id,
+            "title": ctx.current_plan.title,
+            "ticket_id": ctx.current_ticket_id,
+            "status": ctx.current_plan.status,
+            "progress": progress,
+            "toon": toon_serialize(ctx.current_plan),
+        }
+
+    return result
+
+
+@mcp.tool()
+def session_end(
+    summary: Optional[str] = None,
+    outcome: str = "success",
+    path: Optional[str] = None,
+) -> dict:
+    """End the current session.
+
+    Condenses memory, updates plan status if needed, and returns a summary.
+
+    Args:
+        summary: Optional summary of what was accomplished
+        outcome: "success", "blocked", or "abandoned"
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        SessionSummary with progress info and next step.
+
+    Use this when finishing work for the day or switching tasks.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    session_mgr = SessionManager(db, project_id)
+    result = session_mgr.end(summary=summary, outcome=outcome)
+
+    return {
+        "steps_completed": result.steps_completed,
+        "steps_remaining": result.steps_remaining,
+        "blockers": result.blockers,
+        "discoveries_added": result.discoveries_added,
+        "next_step": result.next_step,
+        "plan_status": result.plan_status,
+    }
+
+
+# --- Plan Management ---
+
+
+@mcp.tool()
+def plan_create(
+    title: str,
+    ticket_id: Optional[str] = None,
+    steps: Optional[list[str]] = None,
+    acceptance_criteria: Optional[list[str]] = None,
+    tools: Optional[list[str]] = None,
+    files: Optional[list[str]] = None,
+    activate: bool = True,
+    path: Optional[str] = None,
+) -> dict:
+    """Create a new implementation plan.
+
+    Plans define HOW to accomplish a ticket. Multiple plans can exist per ticket.
+
+    Args:
+        title: Plan title (e.g., "Implement JWT authentication")
+        ticket_id: Optional ticket this plan addresses (e.g., "SEM-45")
+        steps: List of step descriptions
+        acceptance_criteria: List of AC text to track
+        tools: MCP tools this plan will use
+        files: Key files this plan will touch
+        activate: Set as active plan immediately (default True)
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        Created plan in TOON format with ID.
+
+    Example:
+        plan_create(
+            title="Implement JWT authentication",
+            ticket_id="SEM-45",
+            steps=["Create JWTService class", "Add validation middleware", "Write tests"],
+            acceptance_criteria=["Validate tokens", "Support refresh"],
+            tools=["mcp__semfora-engine__search", "Edit", "Bash"],
+            files=["src/auth/jwt.py", "tests/test_auth.py"],
+        )
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    # Validate step lengths and generate warnings
+    validated_steps, step_warnings = _validate_steps(steps)
+
+    session_mgr = SessionManager(db, project_id)
+
+    if activate:
+        plan_id, plan = session_mgr.create_and_activate_plan(
+            title=title,
+            ticket_id=ticket_id,
+            steps=steps,
+            acceptance_criteria=acceptance_criteria,
+            tools=tools,
+            files=files,
+        )
+    else:
+        plan_mgr = PlanManager(db, project_id)
+        plan_id = plan_mgr.create(
+            title=title,
+            ticket_id=ticket_id,
+            steps=steps,
+            acceptance_criteria=acceptance_criteria,
+            tools=tools,
+            files=files,
+        )
+        plan = plan_mgr.get(plan_id)
+
+    result = {
+        "success": True,
+        "plan_id": plan_id,
+        "title": plan.title,
+        "status": plan.status,
+        "progress": get_progress_summary(plan),
+        "toon": toon_serialize(plan),
+    }
+    # Include step length warnings for AI to consider breaking up long steps
+    if step_warnings:
+        result["_warnings"] = step_warnings
+    return result
+
+
+@mcp.tool()
+def plan_activate(plan_id: str, path: Optional[str] = None) -> dict:
+    """Activate a plan and set it as current.
+
+    Args:
+        plan_id: Plan UUID to activate
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        Activated plan details.
+
+    Use this to switch to a different plan.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    session_mgr = SessionManager(db, project_id)
+    plan = session_mgr.activate_plan(plan_id)
+
+    if not plan:
+        return {"error": "not_found", "message": f"Plan not found: {plan_id}"}
+
+    return {
+        "success": True,
+        "plan_id": plan_id,
+        "title": plan.title,
+        "status": plan.status,
+        "progress": get_progress_summary(plan),
+        "toon": toon_serialize(plan),
+    }
+
+
+@mcp.tool()
+async def plan_get(ctx: Context, plan_id: str, path: Optional[str] = None) -> dict:
+    """Get a plan by ID.
+
+    Args:
+        plan_id: Plan UUID
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        Plan details in TOON format.
+    """
+    # Initialize client CWD from MCP roots on first call
+    await _ensure_roots_initialized(ctx)
+
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    plan_mgr = PlanManager(db, project_id)
+    plan = plan_mgr.get(plan_id)
+
+    if not plan:
+        return {"error": "not_found", "message": f"Plan not found: {plan_id}"}
+
+    return {
+        "plan_id": plan_id,
+        "title": plan.title,
+        "ticket_id": plan.ticket_id,
+        "status": plan.status,
+        "progress": get_progress_summary(plan),
+        "toon": toon_serialize(plan),
+    }
+
+
+@mcp.tool()
+async def plan_list(
+    ctx: Context,
+    ticket_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0,
+    path: Optional[str] = None,
+) -> dict:
+    """List plans with optional filtering.
+
+    Args:
+        ticket_id: Filter by ticket (e.g., "SEM-45")
+        status: Filter by status (draft, active, paused, completed, abandoned)
+        limit: Maximum plans to return (default 20, max 50)
+        offset: Skip first N plans for pagination (default 0)
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        List of plan summaries with pagination info.
+    """
+    await _ensure_roots_initialized(ctx)
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    plan_mgr = PlanManager(db, project_id)
+    # Get extra to check has_more
+    limit = min(limit, 50)
+    all_plans = plan_mgr.list(ticket_id=ticket_id, status=status, limit=offset + limit + 1)
+
+    # Apply pagination
+    total_count = len(all_plans)
+    paginated_plans = all_plans[offset:offset + limit]
+    has_more = len(all_plans) > offset + limit
+
+    result = {
+        "plans": [
+            {
+                "id": p.id,
+                "title": p.title,
+                "status": p.status,
+                "ticket_id": p.ticket_id,
+                "completed_steps": p.completed_steps,
+                "step_count": p.step_count,
+                "created_at": p.created_at,
+                "updated_at": p.updated_at,
+            }
+            for p in paginated_plans
+        ],
+        "pagination": {
+            "showing": len(paginated_plans),
+            "offset": offset,
+            "limit": limit,
+            "has_more": has_more,
+            "next_offset": offset + limit if has_more else None,
+        },
+    }
+
+    # Add pagination hint for AI
+    hint = _pagination_hint(has_more, offset + limit if has_more else None, "plan_list")
+    if hint:
+        result["_hint"] = hint
+
+    return result
+
+
+@mcp.tool()
+def plan_step_complete(
+    step_index: int,
+    output: Optional[str] = None,
+    path: Optional[str] = None,
+) -> dict:
+    """Mark a step as completed.
+
+    Args:
+        step_index: Step index (1-based)
+        output: Optional output/result from the step
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        Updated plan progress.
+
+    Use this as you complete each step in the plan.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    session_mgr = SessionManager(db, project_id)
+    session_mgr.record_step_complete(step_index, output)
+
+    # Get updated status
+    status = session_mgr.get_status()
+
+    return {
+        "success": True,
+        "step_completed": step_index,
+        "progress": status.get("active_plan", {}).get("progress"),
+    }
+
+
+@mcp.tool()
+def plan_step_skip(
+    step_index: int,
+    reason: str,
+    approved: bool = False,
+    path: Optional[str] = None,
+) -> dict:
+    """Skip a step with deviation tracking.
+
+    Args:
+        step_index: Step index (1-based)
+        reason: Why the step is being skipped
+        approved: Whether user approved the skip (default False)
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        Updated plan progress.
+
+    Use this when a step needs to be skipped or approach changed.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    session_mgr = SessionManager(db, project_id)
+    session_mgr.record_deviation(step_index, reason, approved)
+
+    # Get updated status
+    status = session_mgr.get_status()
+
+    return {
+        "success": True,
+        "step_skipped": step_index,
+        "reason": reason,
+        "approved": approved,
+        "progress": status.get("active_plan", {}).get("progress"),
+    }
+
+
+@mcp.tool()
+def plan_deviate(
+    reason: str,
+    new_steps: Optional[list[str]] = None,
+    path: Optional[str] = None,
+) -> dict:
+    """Record a deviation from the current plan.
+
+    Args:
+        reason: Why the deviation is happening
+        new_steps: Optional new steps to add
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        Updated plan.
+
+    Use this when changing approach significantly from the original plan.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    # Add discovery for the deviation
+    session_mgr = SessionManager(db, project_id)
+    session_mgr.add_discovery(f"Plan deviation: {reason}", importance=4)
+
+    # Add new steps if provided
+    memory = session_mgr.memory_mgr.get()
+    if memory.current_plan_id and new_steps:
+        plan_mgr = PlanManager(db, project_id)
+        for step_desc in new_steps:
+            plan_mgr.add_step(memory.current_plan_id, step_desc)
+
+        plan = plan_mgr.get(memory.current_plan_id)
+        return {
+            "success": True,
+            "reason": reason,
+            "new_steps_added": len(new_steps),
+            "plan": {
+                "id": memory.current_plan_id,
+                "title": plan.title,
+                "progress": get_progress_summary(plan),
+                "toon": toon_serialize(plan),
+            },
+        }
+
+    return {
+        "success": True,
+        "reason": reason,
+        "deviation_logged": True,
+    }
+
+
+@mcp.tool()
+def plan_complete(plan_id: str, path: Optional[str] = None) -> dict:
+    """Mark a plan as completed.
+
+    Args:
+        plan_id: Plan UUID to complete
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        Completion status.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    plan_mgr = PlanManager(db, project_id)
+    success = plan_mgr.complete(plan_id)
+
+    if not success:
+        return {"error": "not_found", "message": f"Plan not found: {plan_id}"}
+
+    return {"success": True, "plan_id": plan_id, "status": "completed"}
+
+
+@mcp.tool()
+def plan_abandon(
+    plan_id: str,
+    reason: Optional[str] = None,
+    path: Optional[str] = None,
+) -> dict:
+    """Abandon a plan.
+
+    Args:
+        plan_id: Plan UUID to abandon
+        reason: Why the plan is being abandoned
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        Abandonment status.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    plan_mgr = PlanManager(db, project_id)
+    success = plan_mgr.abandon(plan_id, reason)
+
+    if not success:
+        return {"error": "not_found", "message": f"Plan not found: {plan_id}"}
+
+    return {"success": True, "plan_id": plan_id, "status": "abandoned", "reason": reason}
+
+
+@mcp.tool()
+def suggest_next_work(path: Optional[str] = None) -> dict:
+    """Suggest what to work on next based on priorities and blockers.
+
+    Analyzes all active/paused plans and returns recommendations
+    sorted by priority, with blocked items separated.
+
+    Use this when user asks "what should I work on?" or to help
+    prioritize between multiple in-flight tasks.
+
+    Args:
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        - blocked: List of blocked work items
+        - ready: List of unblocked items sorted by priority
+        - recommended: The single best item to work on
+        - summary: Human-readable summary
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    from .session import SessionManager
+
+    session_mgr = SessionManager(db, project_id)
+    result = session_mgr.suggest_next_work()
+
+    # Format for JSON output
+    def format_suggestion(s):
+        return {
+            "plan_id": s.plan_id,
+            "plan_title": s.plan_title,
+            "ticket_id": s.ticket_id,
+            "ticket_title": s.ticket_title,
+            "priority": s.priority,
+            "progress": s.progress,
+            "status": s.status,
+            "reason": s.reason,
+        }
+
+    return {
+        "blocked": [format_suggestion(s) for s in result["blocked"]],
+        "ready": [format_suggestion(s) for s in result["ready"]],
+        "recommended": format_suggestion(result["recommended"]) if result["recommended"] else None,
+        "summary": result["summary"],
+    }
+
+
+@mcp.tool()
+def plan_update(
+    plan_id: str,
+    ticket_id: Optional[str] = None,
+    title: Optional[str] = None,
+    tools: Optional[list[str]] = None,
+    files: Optional[list[str]] = None,
+    path: Optional[str] = None,
+) -> dict:
+    """Update a plan's metadata.
+
+    Use this to:
+    - Retroactively link a plan to a ticket (when a quick fix becomes bigger)
+    - Update the plan title
+    - Add/change tools or files list
+
+    Args:
+        plan_id: Plan to update
+        ticket_id: New ticket ID to link (empty string to unlink)
+        title: New title
+        tools: New tools list
+        files: New files list
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        Updated plan details.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    from .plans import PlanManager
+    from .toon import get_progress_summary
+
+    plan_mgr = PlanManager(db, project_id)
+    plan = plan_mgr.update(
+        plan_id,
+        ticket_id=ticket_id,
+        title=title,
+        tools=tools,
+        files=files,
+    )
+
+    if not plan:
+        return {"error": "not_found", "message": f"Plan {plan_id} not found"}
+
+    progress = get_progress_summary(plan)
+    return {
+        "success": True,
+        "plan_id": plan_id,
+        "title": plan.title,
+        "ticket_id": plan.ticket_id,
+        "status": plan.status,
+        "tools": plan.tools,
+        "files": plan.files,
+        "progress": progress,
+    }
+
+
+@mcp.tool()
+def quick_fix_note(
+    description: str,
+    importance: int = 2,
+    path: Optional[str] = None,
+) -> dict:
+    """Record a quick fix without creating a plan.
+
+    Use this for small fixes that don't warrant full plan tracking.
+    The fix is noted in memory so context isn't lost.
+
+    Perfect for: "I just want to fix this bug quickly, not part of current work"
+
+    Args:
+        description: What was fixed
+        importance: 1-5 (default 2 = normal)
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        Confirmation of the note added.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    from .session import SessionManager
+
+    session_mgr = SessionManager(db, project_id)
+    session_mgr.quick_fix_note(description, importance)
+
+    return {
+        "success": True,
+        "message": f"Quick fix noted: {description}",
+        "importance": importance,
+    }
+
+
+# --- Memory Access ---
+
+
+@mcp.tool()
+def memory_get(path: Optional[str] = None) -> dict:
+    """Get the current project memory.
+
+    Returns condensed context from previous sessions including:
+    - Current work (ticket, plan)
+    - Progress (steps completed, blockers)
+    - Discoveries (patterns learned, decisions made)
+    - Reference (key files, tools)
+
+    Args:
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        ProjectMemory contents.
+
+    Use this to understand the current state before starting work.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    memory_mgr = MemoryManager(db, project_id)
+    memory = memory_mgr.get()
+
+    return {
+        "current_work": {
+            "ticket_id": memory.current_ticket_id,
+            "ticket_title": memory.current_ticket_title,
+            "plan_id": memory.current_plan_id,
+            "plan_title": memory.current_plan_title,
+            "plan_status": memory.current_plan_status,
+        },
+        "progress": {
+            "current_step": memory.current_step,
+            "completed_steps": memory.completed_steps,
+            "total_steps": memory.total_steps,
+            "blockers": memory.blockers,
+        },
+        "discoveries": [
+            {
+                "content": d.content,
+                "importance": d.importance,
+                "created_at": d.created_at,
+            }
+            for d in memory.discoveries
+        ],
+        "reference": {
+            "key_files": memory.key_files,
+            "available_tools": memory.available_tools,
+        },
+        "metadata": {
+            "last_session_end": memory.last_session_end,
+            "updated_at": memory.updated_at,
+            "estimated_tokens": memory.estimate_tokens(),
+        },
+    }
+
+
+@mcp.tool()
+def memory_add_discovery(
+    content: str,
+    importance: int = 2,
+    path: Optional[str] = None,
+) -> dict:
+    """Add a discovery to memory.
+
+    Discoveries are important findings that persist across sessions.
+    Higher importance (1-5) means the discovery is kept longer during condensation.
+
+    Args:
+        content: What was discovered
+        importance: 1-5, higher = more important (default 2)
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        Confirmation.
+
+    Examples:
+        - "Found existing User model with is_active flag" (importance=3)
+        - "Config uses pydantic-settings" (importance=2)
+        - "DATABASE_URL required for tests" (importance=4)
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    memory_mgr = MemoryManager(db, project_id)
+    memory_mgr.add_discovery(content, importance)
+
+    return {"success": True, "discovery": content, "importance": importance}
+
+
+@mcp.tool()
+def memory_add_blocker(blocker: str, path: Optional[str] = None) -> dict:
+    """Add a blocker to memory.
+
+    Args:
+        blocker: Blocker description
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        Confirmation.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    memory_mgr = MemoryManager(db, project_id)
+    memory_mgr.add_blocker(blocker)
+
+    return {"success": True, "blocker": blocker}
+
+
+@mcp.tool()
+def memory_resolve_blocker(blocker: str, path: Optional[str] = None) -> dict:
+    """Mark a blocker as resolved.
+
+    Args:
+        blocker: Blocker to resolve
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        Confirmation.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    memory_mgr = MemoryManager(db, project_id)
+    memory_mgr.remove_blocker(blocker)
+
+    return {"success": True, "resolved": blocker}
+
+
+@mcp.tool()
+def memory_set_files(files: list[str], path: Optional[str] = None) -> dict:
+    """Set the key files list in memory.
+
+    Args:
+        files: List of important file paths
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        Confirmation.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    memory_mgr = MemoryManager(db, project_id)
+    memory_mgr.set_files(files)
+
+    return {"success": True, "files": files}
+
+
+@mcp.tool()
+def memory_set_tools(tools: list[str], path: Optional[str] = None) -> dict:
+    """Set the available tools list in memory.
+
+    Args:
+        tools: List of MCP tool names
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        Confirmation.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    memory_mgr = MemoryManager(db, project_id)
+    memory_mgr.set_tools(tools)
+
+    return {"success": True, "tools": tools}
+
+
+# --- Unified Tickets (v2) ---
+
+
+@mcp.tool()
+def unified_ticket_create(
+    title: str,
+    description: Optional[str] = None,
+    acceptance_criteria: Optional[list[str]] = None,
+    priority: int = 2,
+    labels: Optional[list[str]] = None,
+    tags: Optional[list[str]] = None,
+    path: Optional[str] = None,
+) -> dict:
+    """Create a unified ticket (local source).
+
+    Unified tickets work with both local and external (Linear) sources.
+    This creates a local ticket that can optionally be linked to Linear later.
+
+    Args:
+        title: Ticket title
+        description: Optional description
+        acceptance_criteria: Optional list of AC text
+        priority: 0-4, higher = more important (default 2)
+        labels: Optional labels
+        tags: Optional local tags
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        Created ticket.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    ticket_mgr = TicketManager(db, project_id)
+    ticket_id = ticket_mgr.create(
+        title=title,
+        description=description,
+        acceptance_criteria=acceptance_criteria,
+        priority=priority,
+        labels=labels,
+        tags=tags,
+    )
+
+    ticket = ticket_mgr.get(ticket_id)
+    return {
+        "success": True,
+        "ticket": _format_unified_ticket(ticket),
+    }
+
+
+@mcp.tool()
+def unified_ticket_get(
+    ticket_id: str,
+    path: Optional[str] = None,
+) -> dict:
+    """Get a unified ticket by ID or external ID.
+
+    Args:
+        ticket_id: Ticket UUID or external ID (e.g., "SEM-45")
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        Complete ticket information.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    ticket_mgr = TicketManager(db, project_id)
+
+    # Try by ID first, then by external ID
+    ticket = ticket_mgr.get(ticket_id)
+    if not ticket:
+        ticket = ticket_mgr.get_by_external_id(ticket_id)
+
+    if not ticket:
+        return {"error": "not_found", "message": f"Ticket not found: {ticket_id}"}
+
+    return {"ticket": _format_unified_ticket(ticket)}
+
+
+@mcp.tool()
+def unified_ticket_list(
+    source: Optional[str] = None,
+    status: Optional[str] = None,
+    status_category: Optional[str] = None,
+    priority: Optional[int] = None,
+    limit: int = 20,
+    offset: int = 0,
+    path: Optional[str] = None,
+) -> dict:
+    """List unified tickets with optional filtering.
+
+    Args:
+        source: Filter by source (local, linear, jira)
+        status: Filter by status
+        status_category: Filter by normalized status (todo, in_progress, done, canceled)
+        priority: Filter by priority (0-4)
+        limit: Maximum results (default 20)
+        offset: Skip first N
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        List of ticket summaries.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    ticket_mgr = TicketManager(db, project_id)
+    tickets = ticket_mgr.list(
+        source=source,
+        status=status,
+        status_category=status_category,
+        priority=priority,
+        limit=limit,
+        offset=offset,
+    )
+
+    return {
+        "tickets": [
+            {
+                "id": t.id,
+                "title": t.title,
+                "source": t.source,
+                "status": t.status,
+                "status_category": t.status_category,
+                "priority": t.priority,
+                "external_id": t.external_id,
+                "has_ac": t.has_ac,
+            }
+            for t in tickets
+        ],
+        "count": len(tickets),
+    }
+
+
+@mcp.tool()
+def unified_ticket_update(
+    ticket_id: str,
+    title: Optional[str] = None,
+    description: Optional[str] = None,
+    status: Optional[str] = None,
+    status_category: Optional[str] = None,
+    priority: Optional[int] = None,
+    labels: Optional[list[str]] = None,
+    tags: Optional[list[str]] = None,
+    path: Optional[str] = None,
+) -> dict:
+    """Update a unified ticket.
+
+    Args:
+        ticket_id: Ticket UUID
+        title: New title
+        description: New description
+        status: New status
+        status_category: New normalized status
+        priority: New priority
+        labels: New labels
+        tags: New tags
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        Updated ticket.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    ticket_mgr = TicketManager(db, project_id)
+    ticket = ticket_mgr.update(
+        ticket_id=ticket_id,
+        title=title,
+        description=description,
+        status=status,
+        status_category=status_category,
+        priority=priority,
+        labels=labels,
+        tags=tags,
+    )
+
+    if not ticket:
+        return {"error": "not_found", "message": f"Ticket not found: {ticket_id}"}
+
+    return {
+        "success": True,
+        "ticket": _format_unified_ticket(ticket),
+    }
+
+
+@mcp.tool()
+def unified_ticket_link_external(
+    ticket_id: str,
+    external_item_id: str,
+    path: Optional[str] = None,
+) -> dict:
+    """Link a unified ticket to an external item.
+
+    Args:
+        ticket_id: Ticket UUID
+        external_item_id: External item UUID (from external_items cache)
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        Link status.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    ticket_mgr = TicketManager(db, project_id)
+    success = ticket_mgr.link_external(ticket_id, external_item_id)
+
+    if not success:
+        return {"error": "link_failed", "message": "Could not link ticket to external item"}
+
+    return {"success": True, "ticket_id": ticket_id, "external_item_id": external_item_id}
+
+
+@mcp.tool()
+def unified_ticket_update_ac(
+    ticket_id: str,
+    ac_index: int,
+    status: str,
+    evidence: Optional[str] = None,
+    path: Optional[str] = None,
+) -> dict:
+    """Update an acceptance criterion's status.
+
+    Args:
+        ticket_id: Ticket UUID
+        ac_index: AC index (0-based)
+        status: New status (pending, in_progress, verified, failed)
+        evidence: Optional evidence of completion
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        Update status.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    ticket_mgr = TicketManager(db, project_id)
+    success = ticket_mgr.update_ac_status(ticket_id, ac_index, status, evidence)
+
+    if not success:
+        return {"error": "update_failed", "message": "Could not update AC status"}
+
+    return {
+        "success": True,
+        "ticket_id": ticket_id,
+        "ac_index": ac_index,
+        "status": status,
+    }
+
+
+@mcp.tool()
+def unified_ticket_add_ac(
+    ticket_id: str,
+    text: str,
+    path: Optional[str] = None,
+) -> dict:
+    """Add an acceptance criterion to a ticket.
+
+    Args:
+        ticket_id: Ticket UUID
+        text: AC text
+        path: Directory to get context from (defaults to current directory)
+
+    Returns:
+        Index of the new AC.
+    """
+    try:
+        db, project_id, context = _get_db_for_path(path)
+    except Exception as e:
+        return {"error": "database_error", "message": str(e)}
+
+    ticket_mgr = TicketManager(db, project_id)
+    index = ticket_mgr.add_acceptance_criterion(ticket_id, text)
+
+    return {
+        "success": True,
+        "ticket_id": ticket_id,
+        "ac_index": index,
+        "text": text,
+    }
+
+
+def _format_unified_ticket(ticket: Ticket) -> dict:
+    """Format a unified Ticket for API response."""
+    return {
+        "id": ticket.id,
+        "title": ticket.title,
+        "source": ticket.source,
+        "external_id": ticket.external_id,
+        "external_url": ticket.external_url,
+        "description": ticket.description,
+        "status": ticket.status,
+        "status_category": ticket.status_category,
+        "priority": ticket.priority,
+        "acceptance_criteria": [
+            {
+                "index": ac.index,
+                "text": ac.text,
+                "status": ac.status,
+                "evidence": ac.evidence,
+            }
+            for ac in ticket.acceptance_criteria
+        ],
+        "labels": ticket.labels,
+        "tags": ticket.tags,
+        "created_at": ticket.created_at,
+        "updated_at": ticket.updated_at,
     }
 
 

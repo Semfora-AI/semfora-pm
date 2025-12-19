@@ -1,6 +1,6 @@
 """Database schema definitions and migrations for semfora-pm local storage."""
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Initial schema (version 1)
 SCHEMA_V1 = """
@@ -169,6 +169,157 @@ CREATE INDEX IF NOT EXISTS idx_local_tickets_parent ON local_tickets(parent_tick
 CREATE INDEX IF NOT EXISTS idx_local_tickets_status ON local_tickets(status);
 """
 
+# Schema V4: Plans-as-Memory Architecture
+# Introduces unified tickets, plans, plan steps, and project memory
+SCHEMA_V4_MIGRATION = """
+-- ============================================================
+-- V4: Plans-as-Memory Architecture
+-- Tickets = WHAT (unified local or external source)
+-- Plans = HOW (implementation strategy, foundation of memory)
+-- Memory = Condensed per-project context
+-- ============================================================
+
+-- ============================================================
+-- UNIFIED TICKETS
+-- Can be local-only OR linked to external provider
+-- ============================================================
+CREATE TABLE IF NOT EXISTS tickets (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+
+    -- Source tracking
+    source TEXT NOT NULL DEFAULT 'local',  -- 'local', 'linear', 'jira'
+    external_item_id TEXT REFERENCES external_items(id) ON DELETE SET NULL,
+
+    -- Core fields
+    title TEXT NOT NULL,
+    description TEXT,
+    status TEXT DEFAULT 'pending',          -- pending, in_progress, done, canceled
+    status_category TEXT,                   -- normalized: todo, in_progress, done, canceled
+    priority INTEGER DEFAULT 2,             -- 0-4, higher = more important
+
+    -- Acceptance Criteria (JSON array)
+    -- [{index: 0, text: "...", status: "pending|in_progress|verified|failed", evidence: "..."}]
+    acceptance_criteria TEXT,
+
+    -- Metadata
+    labels TEXT,                            -- JSON array
+    tags TEXT,                              -- JSON array (local categorization)
+
+    -- Timestamps
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================================
+-- PLANS
+-- Implementation strategies - the foundation of memory
+-- Multiple plans can exist per ticket
+-- ============================================================
+CREATE TABLE IF NOT EXISTS plans (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    ticket_id TEXT REFERENCES tickets(id) ON DELETE SET NULL,
+
+    -- Plan content
+    title TEXT NOT NULL,
+    toon_content TEXT NOT NULL,             -- Compact structured format
+
+    -- Status
+    status TEXT DEFAULT 'draft',            -- draft, active, paused, completed, abandoned
+
+    -- Tracking
+    tools_referenced TEXT,                  -- JSON array of MCP tools this plan uses
+    files_referenced TEXT,                  -- JSON array of file paths
+    ac_indices TEXT,                        -- JSON array of AC indices being addressed
+
+    -- Timestamps
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    activated_at TEXT,
+    completed_at TEXT
+);
+
+-- ============================================================
+-- PLAN STEPS
+-- Granular progress tracking within a plan
+-- ============================================================
+CREATE TABLE IF NOT EXISTS plan_steps (
+    id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+
+    order_index INTEGER NOT NULL,
+    description TEXT NOT NULL,
+    status TEXT DEFAULT 'pending',          -- pending, in_progress, completed, skipped
+
+    -- Deviation tracking
+    deviated INTEGER DEFAULT 0,             -- SQLite boolean (0/1)
+    deviation_reason TEXT,
+    deviation_approved INTEGER,             -- SQLite boolean (0/1/NULL)
+
+    -- Output capture
+    output TEXT,                            -- Result/output from completing this step
+
+    -- Timestamps
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    started_at TEXT,
+    completed_at TEXT
+);
+
+-- ============================================================
+-- PROJECT MEMORY
+-- Condensed context loaded at session start
+-- One memory record per project
+-- ============================================================
+CREATE TABLE IF NOT EXISTS project_memory (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL UNIQUE REFERENCES projects(id) ON DELETE CASCADE,
+
+    -- Current state pointers
+    current_ticket_id TEXT REFERENCES tickets(id) ON DELETE SET NULL,
+    current_plan_id TEXT REFERENCES plans(id) ON DELETE SET NULL,
+
+    -- Condensed context (toon format, max ~4000 tokens)
+    memory_blob TEXT,
+
+    -- Quick reference (JSON arrays)
+    key_discoveries TEXT,                   -- Important findings
+    available_tools TEXT,                   -- MCP tools in use
+
+    -- Timestamps
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    last_session_end TEXT
+);
+
+-- ============================================================
+-- INDEXES FOR NEW TABLES
+-- ============================================================
+CREATE INDEX IF NOT EXISTS idx_tickets_project ON tickets(project_id);
+CREATE INDEX IF NOT EXISTS idx_tickets_source ON tickets(source);
+CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status_category);
+CREATE INDEX IF NOT EXISTS idx_tickets_external ON tickets(external_item_id);
+
+CREATE INDEX IF NOT EXISTS idx_plans_project ON plans(project_id);
+CREATE INDEX IF NOT EXISTS idx_plans_ticket ON plans(ticket_id);
+CREATE INDEX IF NOT EXISTS idx_plans_status ON plans(status);
+
+CREATE INDEX IF NOT EXISTS idx_plan_steps_plan ON plan_steps(plan_id);
+CREATE INDEX IF NOT EXISTS idx_plan_steps_status ON plan_steps(status);
+
+-- ============================================================
+-- DATA MIGRATION
+-- Copy existing local_tickets to unified tickets table
+-- ============================================================
+INSERT OR IGNORE INTO tickets (id, project_id, source, title, description, status, priority, tags, created_at, updated_at)
+SELECT id, project_id, 'local', title, description, status, priority, tags, created_at, updated_at
+FROM local_tickets;
+
+-- Create default project_memory for each project
+INSERT OR IGNORE INTO project_memory (id, project_id, updated_at)
+SELECT 'mem_' || id, id, CURRENT_TIMESTAMP
+FROM projects;
+"""
+
 
 def get_migration_sql(from_version: int, to_version: int) -> list[str]:
     """Get SQL statements to migrate from one version to another.
@@ -190,5 +341,8 @@ def get_migration_sql(from_version: int, to_version: int) -> list[str]:
 
     if from_version < 3 <= to_version:
         migrations.append(SCHEMA_V3_MIGRATION)
+
+    if from_version < 4 <= to_version:
+        migrations.append(SCHEMA_V4_MIGRATION)
 
     return migrations
