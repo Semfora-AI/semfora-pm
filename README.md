@@ -1,4 +1,4 @@
-# Semfora PM
+# Semfora PM - EARLY BETA
 
 Connect your AI coding assistant to Linear. Get full ticket context, track progress, and never miss a requirement again.
 
@@ -35,27 +35,7 @@ semfora-pm sprint status
 ### Prerequisites
 
 - Python 3.10+
-- Linear API key ([get one here](https://linear.app/settings/api))
 
-### macOS / Linux
-
-```bash
-# With pip
-pip install semfora-pm
-
-# Or with uv (recommended)
-uv pip install semfora-pm
-```
-
-### Windows
-
-```powershell
-# With pip
-pip install semfora-pm
-
-# Or with uv
-uv pip install semfora-pm
-```
 
 ### From Source
 
@@ -67,7 +47,7 @@ pip install -e .
 
 ## Configuration
 
-Set your Linear API key:
+Set your Linear API key(optional):
 
 ```bash
 # Environment variable (recommended)
