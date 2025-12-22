@@ -1041,11 +1041,11 @@ def get_cache_dir() -> Path:
 
     # Check config file
     config_dir = Path(user_config_dir("semfora-pm", "Semfora"))
-    config_file = config_dir / "config.yaml"
+    config_file = config_dir / "config.json"
     if config_file.exists():
-        import yaml
+        import json
         with open(config_file) as f:
-            config = yaml.safe_load(f) or {}
+            config = json.load(f) or {}
         if cache_dir := config.get("cache_dir"):
             path = Path(cache_dir)
             path.mkdir(parents=True, exist_ok=True)
@@ -1281,8 +1281,8 @@ class AzureADOProvider(ProviderInterface):
 
 ### Auto-Sync Configuration
 
-```yaml
-# .pm/config.yaml
+```json
+# .pm/config.json
 sync:
   # Pull settings
   auto_pull_on_session_start: true
@@ -1688,9 +1688,9 @@ src/semfora_pm/providers/
 
 ## Configuration Files
 
-### Project Config (`.pm/config.yaml`)
+### Project Config (`.pm/config.json`)
 
-```yaml
+```json
 # Project-specific configuration
 # Located in project root
 
@@ -1735,9 +1735,9 @@ acceptance_criteria:
   require_evidence_for_verification: false
 ```
 
-### Global Config (`~/.config/semfora-pm/config.yaml`)
+### Global Config (`~/.config/semfora-pm/config.json`)
 
-```yaml
+```json
 # User-wide configuration
 # Applies to all projects unless overridden
 
@@ -1778,8 +1778,7 @@ dependencies = [
     "mcp>=1.0",
     "httpx>=0.25",
     "pydantic>=2.0",
-    "pyyaml>=6.0",
-    "click>=8.0",
+        "click>=8.0",
 
     # New for v2
     "platformdirs>=4.0",     # Cross-platform cache paths
@@ -1815,7 +1814,7 @@ all = ["jira>=3.5", "asana>=5.0", "azure-devops>=7"]
 ### For Existing Users
 
 1. **Automatic migration on first run**
-   - Detect existing `.pm/config.yaml`
+   - Detect existing `.pm/config.json`
    - Create project database
    - Import project settings
 

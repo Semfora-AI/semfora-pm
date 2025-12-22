@@ -1,7 +1,9 @@
 """Database connection management for semfora-pm local storage."""
 
 import sqlite3
+import shutil
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Generator
 
@@ -101,6 +103,11 @@ class Database:
             current_version = result[0] if result else 0
 
             if current_version < SCHEMA_VERSION:
+                if self.db_path.exists() and self.db_path.stat().st_size > 0:
+                    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+                    backup_path = self.db_path.with_suffix(f"{self.db_path.suffix}.bak.{timestamp}")
+                    shutil.copy2(self.db_path, backup_path)
+
                 # Run migrations
                 for sql in get_migration_sql(current_version, SCHEMA_VERSION):
                     conn.executescript(sql)

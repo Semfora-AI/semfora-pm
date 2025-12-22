@@ -42,8 +42,8 @@ ENV/
 # User ticket data
 tickets/
 
-# Keep config.yaml as it may be a template
-!.pm/config.yaml.example
+# Keep config.json as it may be a template
+!.pm/config.json.example
 
 # OS
 .DS_Store

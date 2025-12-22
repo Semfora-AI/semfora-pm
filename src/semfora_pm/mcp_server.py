@@ -3,10 +3,11 @@
 This MCP server exposes Linear ticket management capabilities to AI assistants,
 enabling ticket-first development workflows.
 
-Supports directory-based configuration via .pm/config.yaml files.
+Supports directory-based configuration via .pm/config.json files.
 """
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
@@ -87,7 +88,7 @@ from .pm_config import (
     get_context_help_message,
 )
 from .db import Database
-from .local_tickets import LocalTicketManager, LocalTicket
+from .tickets import TicketManager
 from .dependencies import DependencyManager
 from .external_items import (
     ExternalItemsManager,
@@ -98,8 +99,35 @@ from .external_items import (
 from .plans import PlanManager, PlanSummary
 from .memory import MemoryManager, ProjectMemory
 from .session import SessionManager, SessionContext
-from .tickets import TicketManager, Ticket, TicketSummary
 from .toon import Plan, serialize as toon_serialize, get_progress_summary
+from .output import format_response, build_pagination, paginate
+from .services.sprints import (
+    sprint_status as svc_sprint_status,
+    sprint_status_aggregated as svc_sprint_status_aggregated,
+    sprint_suggest as svc_sprint_suggest,
+)
+from .services.local_tickets import (
+    create_local_ticket as svc_local_ticket_create,
+    update_local_ticket as svc_local_ticket_update,
+    list_local_tickets as svc_local_ticket_list,
+    get_local_ticket as svc_local_ticket_get,
+    delete_local_ticket as svc_local_ticket_delete,
+)
+from .services.dependencies import (
+    add_dependency as svc_dependency_add,
+    remove_dependency as svc_dependency_remove,
+    get_blockers as svc_get_blockers,
+    get_ready_work as svc_get_ready_work,
+)
+from .services.unified_tickets import (
+    create_unified_ticket as svc_unified_ticket_create,
+    get_unified_ticket as svc_unified_ticket_get,
+    list_unified_tickets as svc_unified_ticket_list,
+    update_unified_ticket as svc_unified_ticket_update,
+    link_unified_ticket_external as svc_unified_ticket_link_external,
+    update_unified_ticket_ac as svc_unified_ticket_update_ac,
+    add_unified_ticket_ac as svc_unified_ticket_add_ac,
+)
 
 # Create the MCP server
 mcp = FastMCP(
@@ -200,7 +228,7 @@ FROM the ticket and contains everything needed to execute.
 - Plans in TOON format are already token-optimized (~70% smaller)
 
 ## Config
-- Uses `.pm/config.yaml` per directory
+- Uses `.pm/config.json` per directory
 - `detect_pm_context` shows active config
 - `scan_pm_dirs` finds all configs in tree"""
 )
@@ -227,7 +255,7 @@ def _get_client_for_path(path: Optional[str] = None) -> tuple[LinearClient, PMCo
 
     if not context.has_team():
         raise ValueError(
-            "No team configured. Create .pm/config.yaml or run 'semfora-pm auth setup'."
+            "No team configured. Create .pm/config.json or run 'semfora-pm auth setup'."
         )
 
     client = LinearClient.from_context(context)
@@ -469,53 +497,24 @@ def _cache_external_item(
         updated_at_provider=issue.get("updatedAt"),
     )
 
+    TicketManager(db, project_id).upsert_external(
+        external_item_id=item.id,
+        title=item.title,
+        description=item.description,
+        status=item.status,
+        status_category=item.status_category,
+        priority=item.priority,
+        labels=item.labels,
+    )
+
     return item.id
-
-
-def _format_local_ticket(ticket: LocalTicket) -> dict:
-    """Format a LocalTicket for API response (full details)."""
-    return {
-        "id": ticket.id,
-        "title": ticket.title,
-        "description": ticket.description,
-        "status": ticket.status,
-        "priority": ticket.priority,
-        "tags": ticket.tags,
-        "parent_ticket": {
-            "id": ticket.linked_ticket_id,
-            "title": ticket.linked_ticket_title,
-        } if ticket.linked_ticket_id else None,
-        "epic": {
-            "id": ticket.linked_epic_id,
-            "name": ticket.linked_epic_name,
-        } if ticket.linked_epic_id else None,
-        "created_at": ticket.created_at,
-        "updated_at": ticket.updated_at,
-        "completed_at": ticket.completed_at,
-    }
-
-
-def _format_local_ticket_summary(ticket: LocalTicket) -> dict:
-    """Format a LocalTicket for list display (minimal, ~25 tokens vs ~100+).
-
-    Excludes description, timestamps, and nested objects to minimize token usage.
-    Use local_ticket_get() to fetch full details for a specific ticket.
-    """
-    return {
-        "id": ticket.id[:8],  # Short ID for display
-        "full_id": ticket.id,  # Full ID for lookups
-        "title": ticket.title[:80] + "..." if len(ticket.title) > 80 else ticket.title,
-        "status": ticket.status,
-        "priority": ticket.priority,
-        "tags": ticket.tags[:3] if ticket.tags else [],  # Max 3 tags
-        "parent_ticket": ticket.linked_ticket_id,  # Just the ID, not nested
-    }
 
 
 @mcp.tool()
 def scan_pm_dirs(
     path: Optional[str] = None,
     max_depth: int = 3,
+    format: str = "toon",
 ) -> dict:
     """Scan directory for all .pm/ configurations.
 
@@ -546,30 +545,40 @@ def scan_pm_dirs(
             "project_name": d.project_name,
         })
 
-    return {
+    result = {
         "directories": formatted,
         "count": len(formatted),
         "base_path": str(base_path or Path.cwd()),
     }
+    return format_response(result, format)
 
 
 @mcp.tool()
-async def detect_pm_context(ctx: Context, path: Optional[str] = None) -> dict:
-    """Detect PM context for a path.
+async def detect_pm_context(
+    ctx: Context,
+    path: Optional[str] = None,
+    format: str = "toon",
+) -> dict:
+    """Detect PM context for a path."""
+    await _ensure_roots_initialized(ctx)
 
-    Args:
-        path: Directory to check (defaults to current directory)
+    path_obj = _get_effective_path(path)
+    context = resolve_context(path_obj)
 
-    Returns resolved PM configuration including:
-    - config_source: Where config was found (directory, parent, user, none)
-    - config_path: Path to config file
-    - provider: PM provider
-    - team_id/team_name: Resolved team
-    - project_id/project_name: Resolved project
-    - api_key configured: Whether auth is set up
+    result = {
+        "config_source": context.config_source,
+        "config_path": str(context.config_path) if context.config_path else None,
+        "provider": context.provider,
+        "team_id": context.team_id,
+        "team_name": context.team_name,
+        "project_id": context.project_id,
+        "project_name": context.project_name,
+        "api_key_configured": context.api_key is not None,
+        "api_key_env": context.api_key_env,
+        "help": get_context_help_message(context) if context.config_source == "none" else None,
+    }
 
-    Use this to verify which team/project will be used for a directory.
-    """
+    return format_response(result, format)
     # Initialize client CWD from MCP roots on first call
     await _ensure_roots_initialized(ctx)
 
@@ -591,7 +600,7 @@ async def detect_pm_context(ctx: Context, path: Optional[str] = None) -> dict:
 
 
 @mcp.tool()
-def check_auth(path: Optional[str] = None) -> dict:
+def check_auth(path: Optional[str] = None, format: str = "toon") -> dict:
     """Check authentication status for a path.
 
     Args:
@@ -603,10 +612,11 @@ def check_auth(path: Optional[str] = None) -> dict:
     context = resolve_context(path_obj)
 
     if not context.api_key:
-        return {
+        result = {
             "authenticated": False,
             "help": LinearConfig.get_auth_help_message(),
         }
+        return format_response(result, format)
 
     # Verify API key works
     try:
@@ -614,7 +624,7 @@ def check_auth(path: Optional[str] = None) -> dict:
         client = LinearClient(config)
         teams = client.get_teams()
 
-        return {
+        result = {
             "authenticated": True,
             "config_source": context.config_source,
             "config_path": str(context.config_path) if context.config_path else None,
@@ -622,16 +632,25 @@ def check_auth(path: Optional[str] = None) -> dict:
             "team_name": context.team_name,
             "available_teams": [{"id": t["id"], "name": t["name"]} for t in teams],
         }
+        return format_response(result, format)
     except Exception as e:
-        return {
+        result = {
             "authenticated": False,
             "error": str(e),
             "help": LinearConfig.get_auth_help_message(),
         }
+        return format_response(result, format)
 
 
 @mcp.tool()
-async def sprint_status(ctx: Context, path: Optional[str] = None, aggregate: bool = False) -> dict:
+async def sprint_status(
+    ctx: Context,
+    path: Optional[str] = None,
+    aggregate: bool = False,
+    limit: int = 20,
+    offset: int = 0,
+    format: str = "toon",
+) -> dict:
     """Get current sprint status showing all active tickets.
 
     Args:
@@ -647,144 +666,21 @@ async def sprint_status(ctx: Context, path: Optional[str] = None, aggregate: boo
     await _ensure_roots_initialized(ctx)
 
     if aggregate:
-        return _sprint_status_aggregated(path)
-
-    client, context, error = _get_client_safe(path)
-    if error:
-        return error
-
-    if not client.config.team_id:
-        return {"error": "No team configured. Create .pm/config.yaml or run 'semfora-pm auth setup'."}
-
-    issues = client.get_team_issues(client.config.team_id)
-
-    # Group by state
-    todo = [_format_issue_summary(i) for i in issues if i["state"]["name"] == "Todo"]
-    in_progress = [_format_issue_summary(i) for i in issues if i["state"]["name"] == "In Progress"]
-    in_review = [_format_issue_summary(i) for i in issues if i["state"]["name"] == "In Review"]
-
-    return {
-        "context": {
-            "config_source": context.config_source,
-            "team_id": context.team_id,
-            "team_name": context.team_name,
-        },
-        "in_progress": in_progress,
-        "in_review": in_review,
-        "todo": todo,
-        "summary": {
-            "in_progress_count": len(in_progress),
-            "in_review_count": len(in_review),
-            "todo_count": len(todo),
-            "total_active": len(in_progress) + len(in_review) + len(todo),
-        }
-    }
+        result = svc_sprint_status_aggregated(Path(path) if path else None, limit=limit, offset=offset)
+    else:
+        result = svc_sprint_status(Path(path) if path else None, limit=limit, offset=offset)
+    return format_response(result, format)
 
 
-def _sprint_status_aggregated(base_path: Optional[str] = None) -> dict:
-    """Aggregate sprint status across all .pm/ configs found in directory tree.
-
-    Handles deduplication when multiple configs point to the same team/project.
-    """
-    path_obj = Path(base_path) if base_path else Path.cwd()
-    dirs = scan_pm_directories(path_obj, max_depth=3)
-
-    if not dirs:
-        # Fall back to single context (might be inherited from parent)
-        context = resolve_context(path_obj)
-        if context.has_team():
-            return sprint_status(base_path, aggregate=False)
-        return {"error": "No .pm/ configurations found. Run 'semfora-pm init' to create one."}
-
-    # Track unique team+project combinations to avoid duplicate API calls
-    seen_configs: set[tuple] = set()  # (team_id, team_name, project_id, project_name)
-    all_issues: dict[str, dict] = {}  # identifier -> issue (for deduping)
-    projects_fetched: list[dict] = []  # Track which projects we fetched from
-    errors: list[dict] = []
-
-    for dir_info in dirs:
-        # Create a config key for deduplication
-        config_key = (
-            dir_info.team_id,
-            dir_info.team_name,
-            dir_info.project_id,
-            dir_info.project_name,
-        )
-
-        if config_key in seen_configs:
-            continue
-        seen_configs.add(config_key)
-
-        # Try to get client for this directory
-        try:
-            client, context = _get_client_for_path(str(dir_info.path))
-        except (AuthenticationError, ValueError) as e:
-            errors.append({
-                "path": str(dir_info.path),
-                "error": str(e),
-            })
-            continue
-
-        if not client.config.team_id:
-            continue
-
-        # Fetch issues
-        try:
-            issues = client.get_team_issues(client.config.team_id)
-
-            project_info = {
-                "path": str(dir_info.path),
-                "team_id": client.config.team_id,
-                "team_name": context.team_name,
-                "project_name": context.project_name,
-                "issue_count": len(issues),
-            }
-            projects_fetched.append(project_info)
-
-            # Add issues, deduping by identifier
-            for issue in issues:
-                identifier = issue["identifier"]
-                if identifier not in all_issues:
-                    all_issues[identifier] = issue
-        except Exception as e:
-            errors.append({
-                "path": str(dir_info.path),
-                "error": str(e),
-            })
-
-    if not all_issues:
-        return {
-            "error": "No tickets found across configured projects",
-            "projects_checked": projects_fetched,
-            "errors": errors if errors else None,
-        }
-
-    # Group by state
-    issues_list = list(all_issues.values())
-    todo = [_format_issue_summary(i) for i in issues_list if i["state"]["name"] == "Todo"]
-    in_progress = [_format_issue_summary(i) for i in issues_list if i["state"]["name"] == "In Progress"]
-    in_review = [_format_issue_summary(i) for i in issues_list if i["state"]["name"] == "In Review"]
-
-    return {
-        "aggregated": True,
-        "projects": projects_fetched,
-        "in_progress": in_progress,
-        "in_review": in_review,
-        "todo": todo,
-        "summary": {
-            "in_progress_count": len(in_progress),
-            "in_review_count": len(in_review),
-            "todo_count": len(todo),
-            "total_active": len(in_progress) + len(in_review) + len(todo),
-            "projects_count": len(projects_fetched),
-            "unique_tickets": len(all_issues),
-        },
-        "errors": errors if errors else None,
-    }
 
 
 @mcp.tool()
-async def get_ticket(ctx: Context, identifier: str, path: Optional[str] = None) -> dict:
+async def get_ticket(
+    ctx: Context,
+    identifier: str,
+    path: Optional[str] = None,
+    format: str = "toon",
+) -> dict:
     """Get full details for a specific ticket.
 
     Args:
@@ -803,12 +699,12 @@ async def get_ticket(ctx: Context, identifier: str, path: Optional[str] = None) 
     await _ensure_roots_initialized(ctx)
     client, context, error = _get_client_safe(path)
     if error:
-        return error
+        return format_response(error, format)
 
     issue = client.get_issue_full(identifier)
 
     if not issue:
-        return {"error": f"Ticket not found: {identifier}"}
+        return format_response({"error": f"Ticket not found: {identifier}"}, format)
 
     # Format labels
     labels = [l["name"] for l in issue.get("labels", {}).get("nodes", [])]
@@ -854,7 +750,7 @@ async def get_ticket(ctx: Context, identifier: str, path: Optional[str] = None) 
             for r in rels
         ]
 
-    return {
+    result = {
         "identifier": issue["identifier"],
         "title": issue["title"],
         "state": issue["state"]["name"],
@@ -874,10 +770,15 @@ async def get_ticket(ctx: Context, identifier: str, path: Optional[str] = None) 
         "created_at": issue.get("createdAt", "")[:10] if issue.get("createdAt") else None,
         "updated_at": issue.get("updatedAt", "")[:10] if issue.get("updatedAt") else None,
     }
+    return format_response(result, format)
 
 
 @mcp.tool()
-def get_ticket_summary(identifier: str, path: Optional[str] = None) -> dict:
+def get_ticket_summary(
+    identifier: str,
+    path: Optional[str] = None,
+    format: str = "toon",
+) -> dict:
     """Get minimal ticket info for CLI status bar display.
 
     Args:
@@ -896,12 +797,12 @@ def get_ticket_summary(identifier: str, path: Optional[str] = None) -> dict:
     """
     client, context, error = _get_client_safe(path)
     if error:
-        return error
+        return format_response(error, format)
 
     issue = client.get_issue_by_identifier(identifier)
 
     if not issue:
-        return {"error": "not_found", "message": f"Ticket {identifier} not found"}
+        return format_response({"error": "not_found", "message": f"Ticket {identifier} not found"}, format)
 
     # Truncate title if too long for display
     title = issue.get("title", "")
@@ -913,13 +814,14 @@ def get_ticket_summary(identifier: str, path: Optional[str] = None) -> dict:
     assignee_name = assignee.get("name") if assignee else None
 
     # Return minimal response (<100 tokens for CLI efficiency)
-    return {
+    result = {
         "identifier": issue["identifier"],
         "title": title,
         "state": issue["state"]["name"],
         "priority": _format_priority(issue.get("priority", 0)),
         "assignee": assignee_name,
     }
+    return format_response(result, format)
 
 
 @mcp.tool()
@@ -933,6 +835,7 @@ async def list_tickets(
     path: Optional[str] = None,
     aggregate: bool = False,
     source: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """List ALL tickets - both from Linear and local storage.
 
@@ -953,7 +856,8 @@ async def list_tickets(
     """
     await _ensure_roots_initialized(ctx)
     if aggregate:
-        return _list_tickets_aggregated(state, label, priority, limit, path)
+        result = _list_tickets_aggregated(state, label, priority, limit, path)
+        return format_response(result, format)
 
     all_tickets = []
 
@@ -961,7 +865,7 @@ async def list_tickets(
     if source != "linear":
         try:
             db, project_id, context = _get_db_for_path(path)
-            ticket_manager = LocalTicketManager(db, project_id)
+            ticket_manager = TicketManager(db, project_id)
 
             # Map state to local status if needed
             local_status = None
@@ -973,10 +877,13 @@ async def list_tickets(
                     "in progress": "in_progress",
                     "in review": "in_progress",
                     "done": "completed",
+                    "blocked": "blocked",
+                    "canceled": "canceled",
+                    "cancelled": "canceled",
                 }
                 local_status = status_map.get(state_lower, state_lower)
 
-            local_tickets = ticket_manager.list(
+            local_tickets = ticket_manager.list_local(
                 status=local_status,
                 include_completed=(state and state.lower() in ["done", "completed"]),
             )
@@ -1053,7 +960,7 @@ async def list_tickets(
     if hint:
         result["_hint"] = hint
 
-    return result
+    return format_response(result, format)
 
 
 def _local_status_to_state(status: str) -> str:
@@ -1062,8 +969,10 @@ def _local_status_to_state(status: str) -> str:
         "pending": "Todo",
         "in_progress": "In Progress",
         "completed": "Done",
+        "done": "Done",
         "blocked": "Blocked",
         "canceled": "Canceled",
+        "cancelled": "Canceled",
         "orphaned": "Orphaned",
     }
     return status_map.get(status, status.title())
@@ -1148,6 +1057,9 @@ def sprint_suggest(
     points: int = 20,
     label: Optional[str] = None,
     path: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0,
+    format: str = "toon",
 ) -> dict:
     """Suggest tickets for next sprint based on priority and points budget.
 
@@ -1158,54 +1070,8 @@ def sprint_suggest(
 
     Returns suggested tickets that fit the point budget, sorted by priority.
     """
-    client, context, error = _get_client_safe(path)
-    if error:
-        return error
-
-    if not client.config.team_id:
-        return {"error": "No team configured."}
-
-    issues = client.get_team_issues(client.config.team_id)
-
-    # Filter to backlog only
-    backlog = [i for i in issues if i["state"]["name"] == "Backlog"]
-
-    if label:
-        backlog = [
-            i for i in backlog
-            if any(l["name"].lower() == label.lower() for l in i.get("labels", {}).get("nodes", []))
-        ]
-
-    if not backlog:
-        return {"error": "No backlog tickets found", "suggested": [], "total_points": 0}
-
-    # Sort by priority (lower is higher priority)
-    sorted_issues = sorted(backlog, key=lambda i: (i.get("priority", 4), -(i.get("estimate") or 0)))
-
-    # Greedily select tickets
-    suggested = []
-    current_points = 0
-
-    for issue in sorted_issues:
-        if current_points >= points:
-            break
-        estimate = issue.get("estimate") or 2  # Default estimate
-        if current_points + estimate <= points:
-            suggested.append(_format_issue_summary(issue))
-            current_points += estimate
-
-    # Get next up (over budget)
-    next_up = [
-        _format_issue_summary(i) for i in sorted_issues
-        if _format_issue_summary(i) not in suggested
-    ][:5]
-
-    return {
-        "suggested": suggested,
-        "total_points": current_points,
-        "target_points": points,
-        "next_up": next_up,
-    }
+    result = svc_sprint_suggest(points=points, label=label, limit=limit, offset=offset, path=Path(path) if path else None)
+    return format_response(result, format)
 
 
 @mcp.tool()
@@ -1219,6 +1085,7 @@ async def search(
     limit: int = 10,
     offset: int = 0,
     path: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """🔍 UNIFIED SEARCH: Search plans, local tickets, AND Linear tickets.
 
@@ -1257,7 +1124,7 @@ async def search(
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     # Normalize status filter
     status = status or "open"
@@ -1347,10 +1214,14 @@ async def search(
 
         # Build query
         sql = """
-            SELECT id, title, status, priority, tags, parent_ticket_id, updated_at, created_at
-            FROM local_tickets
-            WHERE project_id = ?
-              AND (title LIKE ? OR description LIKE ?)
+            SELECT t.id, t.title, t.status, t.priority, t.tags,
+                   t.parent_ticket_id, t.parent_external_item_id,
+                   t.updated_at, t.created_at,
+                   pe.provider_id as parent_external_id
+            FROM tickets t
+            LEFT JOIN external_items pe ON t.parent_external_item_id = pe.id
+            WHERE t.project_id = ? AND t.source = 'local'
+              AND (t.title LIKE ? OR t.description LIKE ?)
         """
         params = [project_id, search_pattern, search_pattern]
 
@@ -1378,19 +1249,25 @@ async def search(
         with db.transaction() as conn:
             rows = conn.execute(sql, params).fetchall()
 
-        results["local_tickets"] = [
-            {
-                "id": row[0][:8],
-                "full_id": row[0],
-                "title": row[1],
-                "status": row[2],
-                "priority": row[3],
-                "tags": row[4],
-                "parent_ticket_id": row[5],
-                "_type": "local_ticket",
-            }
-            for row in rows
-        ]
+        formatted = []
+        for row in rows:
+            tags_value = json.loads(row[4]) if row[4] else []
+            formatted.append(
+                {
+                    "id": row[0][:8],
+                    "full_id": row[0],
+                    "title": row[1],
+                    "status": row[2],
+                    "priority": row[3],
+                    "tags": tags_value,
+                    "parent_ticket_id": row[5],
+                    "parent_external_item_id": row[6],
+                    "parent_external_id": row[9],
+                    "_type": "local_ticket",
+                }
+            )
+
+        results["local_tickets"] = formatted
 
     # === SEARCH LINEAR TICKETS ===
     if source in (None, "linear"):
@@ -1456,14 +1333,16 @@ async def search(
             type_counts.append(f"{len(results['linear_tickets'])} Linear tickets")
         results["_hint"] = f"Found {', '.join(type_counts)}. Use plan_get/local_ticket_get/get_ticket for details."
 
-    return results
+    return format_response(results, format)
 
 
 @mcp.tool()
 def search_tickets(
     query: str,
     limit: int = 10,
+    offset: int = 0,
     path: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """Search for tickets by text query.
 
@@ -1479,19 +1358,21 @@ def search_tickets(
     """
     client, context, error = _get_client_safe(path)
     if error:
-        return error
+        return format_response(error, format)
 
     results = client.search_issues(query)
 
     if not results:
-        return {"tickets": [], "count": 0}
+        return format_response({"tickets": [], "pagination": {"total_count": 0, "offset": offset, "limit": limit}}, format)
 
-    tickets = [_format_issue_summary(i) for i in results[:limit]]
+    summaries = [_format_issue_summary(i) for i in results]
+    page, pagination = paginate(summaries, limit, offset)
 
-    return {
-        "tickets": tickets,
-        "count": len(tickets),
+    result = {
+        "tickets": page,
+        "pagination": pagination,
     }
+    return format_response(result, format)
 
 
 @mcp.tool()
@@ -1499,6 +1380,7 @@ def update_ticket_status(
     identifier: str,
     state: str,
     path: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """Update a ticket's status.
 
@@ -1511,17 +1393,17 @@ def update_ticket_status(
     """
     client, context, error = _get_client_safe(path)
     if error:
-        return error
+        return format_response(error, format)
 
     # Get issue to find team
     issue = client.get_issue_by_identifier(identifier)
     if not issue:
-        return {"error": f"Ticket not found: {identifier}"}
+        return format_response({"error": f"Ticket not found: {identifier}"}, format)
 
     # Use configured team_id or try to get from issue
     team_id = client.config.team_id
     if not team_id:
-        return {"error": "No team configured"}
+        return format_response({"error": "No team configured"}, format)
 
     # Get state ID
     states = client.get_team_states(team_id)
@@ -1529,23 +1411,27 @@ def update_ticket_status(
 
     if not state_id:
         available = list(states.keys())
-        return {"error": f"Invalid state '{state}'. Available: {available}"}
+        return format_response({"error": f"Invalid state '{state}'. Available: {available}"}, format)
 
     # Update the issue
     result = client.update_issue(issue["id"], state_id=state_id)
 
-    return {
+    result = {
         "success": True,
         "identifier": identifier,
         "new_state": state,
         "url": result.get("url"),
     }
+    return format_response(result, format)
 
 
 @mcp.tool()
 def get_related_tickets(
     identifier: str,
     path: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0,
+    format: str = "toon",
 ) -> dict:
     """Get all tickets related to a specific ticket.
 
@@ -1564,12 +1450,12 @@ def get_related_tickets(
     """
     client, context, error = _get_client_safe(path)
     if error:
-        return error
+        return format_response(error, format)
 
     issue = client.get_issue_full(identifier)
 
     if not issue:
-        return {"error": f"Ticket not found: {identifier}"}
+        return format_response({"error": f"Ticket not found: {identifier}"}, format)
 
     # Get relations
     relations = issue.get("relations", {}).get("nodes", [])
@@ -1609,15 +1495,27 @@ def get_related_tickets(
         for s in sub_issues
     ]
 
-    return {
+    blocks, blocks_pagination = paginate(get_relation_details("blocks"), limit, offset)
+    blocked_by, blocked_by_pagination = paginate(get_relation_details("blocked"), limit, offset)
+    related, related_pagination = paginate(get_relation_details("related"), limit, offset)
+    sub_issues_page, sub_issues_pagination = paginate(sub_list, limit, offset)
+
+    result = {
         "identifier": identifier,
         "title": issue["title"],
-        "blocks": get_relation_details("blocks"),
-        "blocked_by": get_relation_details("blocked"),
-        "related": get_relation_details("related"),
+        "blocks": blocks,
+        "blocked_by": blocked_by,
+        "related": related,
         "parent": parent_info,
-        "sub_issues": sub_list,
+        "sub_issues": sub_issues_page,
+        "pagination": {
+            "blocks": blocks_pagination,
+            "blocked_by": blocked_by_pagination,
+            "related": related_pagination,
+            "sub_issues": sub_issues_pagination,
+        },
     }
+    return format_response(result, format)
 
 
 # ============================================================================
@@ -1636,16 +1534,17 @@ def local_ticket_create(
     blocks: Optional[list[str]] = None,
     blocked_by: Optional[list[str]] = None,
     path: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """Create a local ticket for tracking work.
 
     Local tickets are stored locally and work fully offline.
-    They can optionally be linked to a parent Linear ticket.
+    They can optionally be linked to a parent local ticket or Linear ticket.
 
     Args:
         title: Ticket title (what needs to be done)
         description: Optional detailed description
-        parent_ticket_id: Parent Linear ticket to link (e.g., "SEM-123")
+        parent_ticket_id: Parent local ticket ID or Linear ticket (e.g., UUID or "SEM-123")
         priority: 0-4, higher = more important (default 2)
         tags: Optional list of tags for categorization
         status: Initial status (pending, in_progress, blocked) - default 'pending'
@@ -1662,61 +1561,45 @@ def local_ticket_create(
        - local_ticket_create("Add refresh token logic", parent_ticket_id="SEM-45", blocked_by=[ticket1_id])
     """
     try:
-        db, project_id, context = _get_db_for_path(path)
+        db, project_id, _ = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
-    # Link to external item if parent_ticket_id provided
-    external_item_id = None
-    if parent_ticket_id:
-        external_item_id = _cache_external_item(db, project_id, parent_ticket_id, path)
-        if not external_item_id:
-            return {
-                "error": "ticket_not_found",
-                "message": f"Could not find or cache parent ticket: {parent_ticket_id}",
-            }
+    ticket_manager = TicketManager(db, project_id)
+    ext_manager = ExternalItemsManager(db, project_id)
 
-    # Create the ticket
-    ticket_manager = LocalTicketManager(db, project_id)
-    ticket = ticket_manager.create(
+    result = svc_local_ticket_create(
+        ticket_manager,
+        ext_manager,
         title=title,
         description=description,
-        parent_ticket_id=external_item_id,
+        parent_ticket_id=parent_ticket_id,
         priority=priority,
         tags=tags,
         status=status,
+        cache_external=lambda pid: _cache_external_item(db, project_id, pid, path),
     )
 
-    # Add dependencies if specified
-    dep_manager = DependencyManager(db, project_id)
-
-    if blocks:
-        for target_id in blocks:
+    if blocks or blocked_by:
+        dep_manager = DependencyManager(db, project_id)
+        for target_id in blocks or []:
             dep_manager.add(
-                source_id=ticket.id,
+                source_id=result["ticket"]["id"],
                 target_id=target_id,
                 relation="blocks",
                 source_type="local",
                 target_type="local",
             )
-
-    if blocked_by:
-        for source_id in blocked_by:
+        for source_id in blocked_by or []:
             dep_manager.add(
                 source_id=source_id,
-                target_id=ticket.id,
+                target_id=result["ticket"]["id"],
                 relation="blocks",
                 source_type="local",
                 target_type="local",
             )
 
-    # Re-fetch to get full denormalized data
-    ticket = ticket_manager.get(ticket.id)
-
-    return {
-        "success": True,
-        "ticket": _format_local_ticket(ticket),
-    }
+    return format_response(result, format)
 
 
 @mcp.tool()
@@ -1729,6 +1612,7 @@ def local_ticket_update(
     tags: Optional[list[str]] = None,
     parent_ticket_id: Optional[str] = None,
     path: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """Update a local ticket.
 
@@ -1739,51 +1623,33 @@ def local_ticket_update(
         status: New status (pending, in_progress, completed, blocked, canceled)
         priority: New priority (0-4)
         tags: New tags list (replaces existing)
-        parent_ticket_id: Link to different parent ticket (or empty string to unlink)
+        parent_ticket_id: Link to different parent ticket (local ID or Linear ID, empty string to unlink)
         path: Directory to get context from (defaults to current directory)
 
     Returns updated ticket or error.
     """
     try:
-        db, project_id, context = _get_db_for_path(path)
+        db, project_id, _ = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
-    ticket_manager = LocalTicketManager(db, project_id)
+    ticket_manager = TicketManager(db, project_id)
+    ext_manager = ExternalItemsManager(db, project_id)
 
-    # Check ticket exists
-    existing = ticket_manager.get(ticket_id)
-    if not existing:
-        return {"error": "not_found", "message": f"Ticket not found: {ticket_id}"}
-
-    # Handle parent ticket linking
-    external_item_id = None
-    if parent_ticket_id is not None:
-        if parent_ticket_id == "":
-            external_item_id = ""  # Signal to unlink
-        else:
-            external_item_id = _cache_external_item(db, project_id, parent_ticket_id, path)
-            if not external_item_id:
-                return {
-                    "error": "ticket_not_found",
-                    "message": f"Could not find or cache parent ticket: {parent_ticket_id}",
-                }
-
-    # Update the ticket
-    ticket = ticket_manager.update(
+    result = svc_local_ticket_update(
+        ticket_manager,
+        ext_manager,
         ticket_id=ticket_id,
         title=title,
         description=description,
         status=status,
         priority=priority,
         tags=tags,
-        parent_ticket_id=external_item_id,
+        parent_ticket_id=parent_ticket_id,
+        cache_external=lambda pid: _cache_external_item(db, project_id, pid, path),
     )
 
-    return {
-        "success": True,
-        "ticket": _format_local_ticket(ticket),
-    }
+    return format_response(result, format)
 
 
 @mcp.tool()
@@ -1796,6 +1662,7 @@ async def local_ticket_list(
     limit: int = 20,
     offset: int = 0,
     path: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """List local tickets with optional filtering.
 
@@ -1803,7 +1670,7 @@ async def local_ticket_list(
     Use local_ticket_get(ticket_id) to fetch full details including description.
 
     Args:
-        parent_ticket_id: Filter by parent ticket (e.g., "SEM-123")
+        parent_ticket_id: Filter by parent ticket (local ID or Linear ID, e.g., UUID or "SEM-123")
         epic_id: Filter by epic - shows tickets across ALL parent tickets in that epic!
         status: Filter by status (pending, in_progress, completed, blocked, canceled, orphaned)
         include_completed: Include completed/canceled/orphaned tickets (default False)
@@ -1819,57 +1686,29 @@ async def local_ticket_list(
     """
     await _ensure_roots_initialized(ctx)
     try:
-        db, project_id, context = _get_db_for_path(path)
+        db, project_id, _ = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
-    ticket_manager = LocalTicketManager(db, project_id)
+    ticket_manager = TicketManager(db, project_id)
+    ext_manager = ExternalItemsManager(db, project_id)
 
-    # Resolve parent_ticket_id to internal UUID if provided
-    external_item_id = None
-    if parent_ticket_id:
-        ext_manager = ExternalItemsManager(db, project_id)
-        external_item_id = ext_manager.get_uuid_for_provider_id(parent_ticket_id)
-        if not external_item_id:
-            # Try caching first
-            external_item_id = _cache_external_item(db, project_id, parent_ticket_id, path)
-
-    # Fetch all matching tickets (we'll paginate in memory for now)
-    all_tickets = ticket_manager.list(
-        parent_ticket_id=external_item_id,
+    result = svc_local_ticket_list(
+        ticket_manager,
+        ext_manager,
+        parent_ticket_id=parent_ticket_id,
         epic_id=epic_id,
         status=status,
         include_completed=include_completed,
+        limit=limit,
+        offset=offset,
+        cache_external=lambda pid: _cache_external_item(db, project_id, pid, path),
     )
-
-    # Apply pagination
-    limit = min(limit, 100)  # Cap at 100
-    total_count = len(all_tickets)
-    paginated_tickets = all_tickets[offset:offset + limit]
-    has_more = (offset + limit) < total_count
-
-    result = {
-        "tickets": [_format_local_ticket_summary(t) for t in paginated_tickets],
-        "pagination": {
-            "total_count": total_count,
-            "showing": len(paginated_tickets),
-            "offset": offset,
-            "limit": limit,
-            "has_more": has_more,
-            "next_offset": offset + limit if has_more else None,
-        },
-    }
-
-    # Add pagination hint for AI
-    hint = _pagination_hint(has_more, offset + limit if has_more else None, "local_ticket_list")
-    if hint:
-        result["_hint"] = hint
-
-    return result
+    return format_response(result, format)
 
 
 @mcp.tool()
-def local_ticket_get(ticket_id: str, path: Optional[str] = None) -> dict:
+def local_ticket_get(ticket_id: str, path: Optional[str] = None, format: str = "toon") -> dict:
     """Get full details for a single local ticket including description.
 
     Use this to fetch complete ticket information when you need it.
@@ -1882,35 +1721,17 @@ def local_ticket_get(ticket_id: str, path: Optional[str] = None) -> dict:
     Returns complete ticket with description, timestamps, parent ticket details.
     """
     try:
-        db, project_id, context = _get_db_for_path(path)
+        db, project_id, _ = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
-    ticket_manager = LocalTicketManager(db, project_id)
-
-    # Support short ID lookup (first 8 chars)
-    ticket = ticket_manager.get(ticket_id)
-    if not ticket and len(ticket_id) == 8:
-        # Try to find by prefix
-        all_tickets = ticket_manager.list(include_completed=True)
-        matches = [t for t in all_tickets if t.id.startswith(ticket_id)]
-        if len(matches) == 1:
-            ticket = matches[0]
-        elif len(matches) > 1:
-            return {
-                "error": "ambiguous_id",
-                "message": f"Multiple tickets match prefix '{ticket_id}'",
-                "matches": [{"id": t.id, "title": t.title} for t in matches],
-            }
-
-    if not ticket:
-        return {"error": "not_found", "message": f"Ticket not found: {ticket_id}"}
-
-    return {"ticket": _format_local_ticket(ticket)}
+    ticket_manager = TicketManager(db, project_id)
+    result = svc_local_ticket_get(ticket_manager, ticket_id)
+    return format_response(result, format)
 
 
 @mcp.tool()
-def local_ticket_delete(ticket_id: str, path: Optional[str] = None) -> dict:
+def local_ticket_delete(ticket_id: str, path: Optional[str] = None, format: str = "toon") -> dict:
     """Delete a local ticket.
 
     Also removes any dependencies involving this ticket.
@@ -1922,25 +1743,13 @@ def local_ticket_delete(ticket_id: str, path: Optional[str] = None) -> dict:
     Returns success or error.
     """
     try:
-        db, project_id, context = _get_db_for_path(path)
+        db, project_id, _ = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
-    ticket_manager = LocalTicketManager(db, project_id)
-
-    # Check ticket exists
-    existing = ticket_manager.get(ticket_id)
-    if not existing:
-        return {"error": "not_found", "message": f"Ticket not found: {ticket_id}"}
-
-    # Delete (cascades to dependencies)
-    deleted = ticket_manager.delete(ticket_id)
-
-    return {
-        "success": deleted,
-        "deleted_ticket_id": ticket_id,
-        "deleted_title": existing.title,
-    }
+    ticket_manager = TicketManager(db, project_id)
+    result = svc_local_ticket_delete(ticket_manager, ticket_id)
+    return format_response(result, format)
 
 
 # ============================================================================
@@ -1957,6 +1766,7 @@ def dependency_add(
     target_type: str = "local",
     notes: Optional[str] = None,
     path: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """Add a dependency relationship between items.
 
@@ -1975,50 +1785,25 @@ def dependency_add(
         dependency_add(source_id=plan_a_id, target_id=plan_b_id, relation="blocks")
     """
     try:
-        db, project_id, context = _get_db_for_path(path)
+        db, project_id, _ = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
-
-    # Resolve external IDs if needed
-    if source_type == "external":
-        ext_manager = ExternalItemsManager(db, project_id)
-        uuid = ext_manager.get_uuid_for_provider_id(source_id)
-        if not uuid:
-            uuid = _cache_external_item(db, project_id, source_id, path)
-        if uuid:
-            source_id = uuid
-
-    if target_type == "external":
-        ext_manager = ExternalItemsManager(db, project_id)
-        uuid = ext_manager.get_uuid_for_provider_id(target_id)
-        if not uuid:
-            uuid = _cache_external_item(db, project_id, target_id, path)
-        if uuid:
-            target_id = uuid
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     dep_manager = DependencyManager(db, project_id)
+    ext_manager = ExternalItemsManager(db, project_id)
 
-    dep = dep_manager.add(
+    result = svc_dependency_add(
+        dep_manager,
+        ext_manager,
         source_id=source_id,
         target_id=target_id,
         relation=relation,
         source_type=source_type,
         target_type=target_type,
         notes=notes,
+        cache_external=lambda pid: _cache_external_item(db, project_id, pid, path),
     )
-
-    return {
-        "success": True,
-        "dependency": {
-            "id": dep.id,
-            "source_id": dep.source_id,
-            "source_type": dep.source_type,
-            "target_id": dep.target_id,
-            "target_type": dep.target_type,
-            "relation": dep.relation,
-            "notes": dep.notes,
-        },
-    }
+    return format_response(result, format)
 
 
 @mcp.tool()
@@ -2029,6 +1814,7 @@ def dependency_remove(
     source_type: str = "local",
     target_type: str = "local",
     path: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """Remove a dependency relationship.
 
@@ -2043,24 +1829,20 @@ def dependency_remove(
     Returns count of removed dependencies.
     """
     try:
-        db, project_id, context = _get_db_for_path(path)
+        db, project_id, _ = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     dep_manager = DependencyManager(db, project_id)
-
-    count = dep_manager.remove(
+    result = svc_dependency_remove(
+        dep_manager,
         source_id=source_id,
         target_id=target_id,
         relation=relation,
         source_type=source_type,
         target_type=target_type,
     )
-
-    return {
-        "success": True,
-        "removed_count": count,
-    }
+    return format_response(result, format)
 
 
 @mcp.tool()
@@ -2070,6 +1852,9 @@ def get_blockers(
     recursive: bool = False,
     include_resolved: bool = False,
     path: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0,
+    format: str = "toon",
 ) -> dict:
     """Get items blocking this one.
 
@@ -2084,39 +1869,21 @@ def get_blockers(
     Useful to understand why an item can't be started.
     """
     try:
-        db, project_id, context = _get_db_for_path(path)
+        db, project_id, _ = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     dep_manager = DependencyManager(db, project_id)
-
-    blockers = dep_manager.get_blockers(
+    result = svc_get_blockers(
+        dep_manager,
         item_id=item_id,
         item_type=item_type,
         recursive=recursive,
         include_resolved=include_resolved,
+        limit=limit,
+        offset=offset,
     )
-
-    formatted = [
-        {
-            "item_type": b.item_type,
-            "item_id": b.item_id,
-            "title": b.title,
-            "status": b.status,
-            "depth": b.depth,
-            "resolved": b.resolved,
-        }
-        for b in blockers
-    ]
-
-    unresolved_count = len([b for b in blockers if not b.resolved])
-
-    return {
-        "blockers": formatted,
-        "count": len(formatted),
-        "unresolved_count": unresolved_count,
-        "is_blocked": unresolved_count > 0,
-    }
+    return format_response(result, format)
 
 
 @mcp.tool()
@@ -2125,6 +1892,8 @@ async def get_ready_work(
     include_local: bool = True,
     limit: int = 5,
     path: Optional[str] = None,
+    offset: int = 0,
+    format: str = "toon",
 ) -> dict:
     """Get unblocked items ready to work on.
 
@@ -2142,34 +1911,18 @@ async def get_ready_work(
     """
     await _ensure_roots_initialized(ctx)
     try:
-        db, project_id, context = _get_db_for_path(path)
+        db, project_id, _ = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     dep_manager = DependencyManager(db, project_id)
-
-    ready = dep_manager.get_ready_work(
+    result = svc_get_ready_work(
+        dep_manager,
         include_local=include_local,
         limit=limit,
+        offset=offset,
     )
-
-    formatted = [
-        {
-            "item_type": r.item_type,
-            "item_id": r.item_id,
-            "title": r.title,
-            "status": r.status,
-            "priority": r.priority,
-            "linked_ticket_id": r.linked_ticket_id,
-            "linked_epic_id": r.linked_epic_id,
-        }
-        for r in ready
-    ]
-
-    return {
-        "ready_items": formatted,
-        "count": len(formatted),
-    }
+    return format_response(result, format)
 
 
 # ============================================================================
@@ -2186,6 +1939,7 @@ async def session_start(
     ticket_id: Optional[str] = None,
     query: Optional[str] = None,
     path: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """Start a new session and load memory context.
 
@@ -2209,7 +1963,7 @@ async def session_start(
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     session_mgr = SessionManager(db, project_id)
     ctx = session_mgr.start(ticket_id=ticket_id, query=query)
@@ -2262,11 +2016,11 @@ async def session_start(
             for p in ctx.matching_plans
         ]
 
-    return result
+    return format_response(result, format)
 
 
 @mcp.tool()
-def session_continue(path: Optional[str] = None) -> dict:
+def session_continue(path: Optional[str] = None, format: str = "toon") -> dict:
     """Continue from the last active plan.
 
     This is the "continue" command - resume exactly where you left off.
@@ -2282,7 +2036,7 @@ def session_continue(path: Optional[str] = None) -> dict:
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     session_mgr = SessionManager(db, project_id)
     ctx = session_mgr.continue_session()
@@ -2303,7 +2057,7 @@ def session_continue(path: Optional[str] = None) -> dict:
             "toon": toon_serialize(ctx.current_plan),
         }
 
-    return result
+    return format_response(result, format)
 
 
 @mcp.tool()
@@ -2311,6 +2065,7 @@ def session_end(
     summary: Optional[str] = None,
     outcome: str = "success",
     path: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """End the current session.
 
@@ -2329,12 +2084,12 @@ def session_end(
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     session_mgr = SessionManager(db, project_id)
     result = session_mgr.end(summary=summary, outcome=outcome)
 
-    return {
+    result = {
         "steps_completed": result.steps_completed,
         "steps_remaining": result.steps_remaining,
         "blockers": result.blockers,
@@ -2342,6 +2097,7 @@ def session_end(
         "next_step": result.next_step,
         "plan_status": result.plan_status,
     }
+    return format_response(result, format)
 
 
 # --- Plan Management ---
@@ -2357,6 +2113,7 @@ def plan_create(
     files: Optional[list[str]] = None,
     activate: bool = True,
     path: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """Create a new implementation plan.
 
@@ -2388,7 +2145,7 @@ def plan_create(
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     # Validate step lengths and generate warnings
     validated_steps, step_warnings = _validate_steps(steps)
@@ -2427,11 +2184,11 @@ def plan_create(
     # Include step length warnings for AI to consider breaking up long steps
     if step_warnings:
         result["_warnings"] = step_warnings
-    return result
+    return format_response(result, format)
 
 
 @mcp.tool()
-def plan_activate(plan_id: str, path: Optional[str] = None) -> dict:
+def plan_activate(plan_id: str, path: Optional[str] = None, format: str = "toon") -> dict:
     """Activate a plan and set it as current.
 
     Args:
@@ -2446,15 +2203,15 @@ def plan_activate(plan_id: str, path: Optional[str] = None) -> dict:
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     session_mgr = SessionManager(db, project_id)
     plan = session_mgr.activate_plan(plan_id)
 
     if not plan:
-        return {"error": "not_found", "message": f"Plan not found: {plan_id}"}
+        return format_response({"error": "not_found", "message": f"Plan not found: {plan_id}"}, format)
 
-    return {
+    result = {
         "success": True,
         "plan_id": plan_id,
         "title": plan.title,
@@ -2462,10 +2219,11 @@ def plan_activate(plan_id: str, path: Optional[str] = None) -> dict:
         "progress": get_progress_summary(plan),
         "toon": toon_serialize(plan),
     }
+    return format_response(result, format)
 
 
 @mcp.tool()
-async def plan_get(ctx: Context, plan_id: str, path: Optional[str] = None) -> dict:
+async def plan_get(ctx: Context, plan_id: str, path: Optional[str] = None, format: str = "toon") -> dict:
     """Get a plan by ID.
 
     Args:
@@ -2481,15 +2239,15 @@ async def plan_get(ctx: Context, plan_id: str, path: Optional[str] = None) -> di
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     plan_mgr = PlanManager(db, project_id)
     plan = plan_mgr.get(plan_id)
 
     if not plan:
-        return {"error": "not_found", "message": f"Plan not found: {plan_id}"}
+        return format_response({"error": "not_found", "message": f"Plan not found: {plan_id}"}, format)
 
-    return {
+    result = {
         "plan_id": plan_id,
         "title": plan.title,
         "ticket_id": plan.ticket_id,
@@ -2497,6 +2255,7 @@ async def plan_get(ctx: Context, plan_id: str, path: Optional[str] = None) -> di
         "progress": get_progress_summary(plan),
         "toon": toon_serialize(plan),
     }
+    return format_response(result, format)
 
 
 @mcp.tool()
@@ -2507,6 +2266,7 @@ async def plan_list(
     limit: int = 20,
     offset: int = 0,
     path: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """List plans with optional filtering.
 
@@ -2524,17 +2284,12 @@ async def plan_list(
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     plan_mgr = PlanManager(db, project_id)
-    # Get extra to check has_more
     limit = min(limit, 50)
-    all_plans = plan_mgr.list(ticket_id=ticket_id, status=status, limit=offset + limit + 1)
-
-    # Apply pagination
-    total_count = len(all_plans)
-    paginated_plans = all_plans[offset:offset + limit]
-    has_more = len(all_plans) > offset + limit
+    total_count = plan_mgr.count(ticket_id=ticket_id, status=status)
+    paginated_plans = plan_mgr.list(ticket_id=ticket_id, status=status, limit=limit, offset=offset)
 
     result = {
         "plans": [
@@ -2550,21 +2305,19 @@ async def plan_list(
             }
             for p in paginated_plans
         ],
-        "pagination": {
-            "showing": len(paginated_plans),
-            "offset": offset,
-            "limit": limit,
-            "has_more": has_more,
-            "next_offset": offset + limit if has_more else None,
-        },
+        "pagination": build_pagination(total_count, limit, offset),
     }
 
     # Add pagination hint for AI
-    hint = _pagination_hint(has_more, offset + limit if has_more else None, "plan_list")
+    hint = _pagination_hint(
+        result["pagination"]["has_more"],
+        result["pagination"]["next_offset"],
+        "plan_list",
+    )
     if hint:
         result["_hint"] = hint
 
-    return result
+    return format_response(result, format)
 
 
 @mcp.tool()
@@ -2572,6 +2325,7 @@ def plan_step_complete(
     step_index: int,
     output: Optional[str] = None,
     path: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """Mark a step as completed.
 
@@ -2588,7 +2342,7 @@ def plan_step_complete(
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     session_mgr = SessionManager(db, project_id)
     session_mgr.record_step_complete(step_index, output)
@@ -2596,11 +2350,12 @@ def plan_step_complete(
     # Get updated status
     status = session_mgr.get_status()
 
-    return {
+    result = {
         "success": True,
         "step_completed": step_index,
         "progress": status.get("active_plan", {}).get("progress"),
     }
+    return format_response(result, format)
 
 
 @mcp.tool()
@@ -2609,6 +2364,7 @@ def plan_step_skip(
     reason: str,
     approved: bool = False,
     path: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """Skip a step with deviation tracking.
 
@@ -2626,7 +2382,7 @@ def plan_step_skip(
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     session_mgr = SessionManager(db, project_id)
     session_mgr.record_deviation(step_index, reason, approved)
@@ -2634,13 +2390,14 @@ def plan_step_skip(
     # Get updated status
     status = session_mgr.get_status()
 
-    return {
+    result = {
         "success": True,
         "step_skipped": step_index,
         "reason": reason,
         "approved": approved,
         "progress": status.get("active_plan", {}).get("progress"),
     }
+    return format_response(result, format)
 
 
 @mcp.tool()
@@ -2648,6 +2405,7 @@ def plan_deviate(
     reason: str,
     new_steps: Optional[list[str]] = None,
     path: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """Record a deviation from the current plan.
 
@@ -2664,7 +2422,7 @@ def plan_deviate(
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     # Add discovery for the deviation
     session_mgr = SessionManager(db, project_id)
@@ -2678,7 +2436,7 @@ def plan_deviate(
             plan_mgr.add_step(memory.current_plan_id, step_desc)
 
         plan = plan_mgr.get(memory.current_plan_id)
-        return {
+        result = {
             "success": True,
             "reason": reason,
             "new_steps_added": len(new_steps),
@@ -2689,16 +2447,18 @@ def plan_deviate(
                 "toon": toon_serialize(plan),
             },
         }
+        return format_response(result, format)
 
-    return {
+    result = {
         "success": True,
         "reason": reason,
         "deviation_logged": True,
     }
+    return format_response(result, format)
 
 
 @mcp.tool()
-def plan_complete(plan_id: str, path: Optional[str] = None) -> dict:
+def plan_complete(plan_id: str, path: Optional[str] = None, format: str = "toon") -> dict:
     """Mark a plan as completed.
 
     Args:
@@ -2711,15 +2471,15 @@ def plan_complete(plan_id: str, path: Optional[str] = None) -> dict:
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     plan_mgr = PlanManager(db, project_id)
     success = plan_mgr.complete(plan_id)
 
     if not success:
-        return {"error": "not_found", "message": f"Plan not found: {plan_id}"}
+        return format_response({"error": "not_found", "message": f"Plan not found: {plan_id}"}, format)
 
-    return {"success": True, "plan_id": plan_id, "status": "completed"}
+    return format_response({"success": True, "plan_id": plan_id, "status": "completed"}, format)
 
 
 @mcp.tool()
@@ -2727,6 +2487,7 @@ def plan_abandon(
     plan_id: str,
     reason: Optional[str] = None,
     path: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """Abandon a plan.
 
@@ -2741,19 +2502,19 @@ def plan_abandon(
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     plan_mgr = PlanManager(db, project_id)
     success = plan_mgr.abandon(plan_id, reason)
 
     if not success:
-        return {"error": "not_found", "message": f"Plan not found: {plan_id}"}
+        return format_response({"error": "not_found", "message": f"Plan not found: {plan_id}"}, format)
 
-    return {"success": True, "plan_id": plan_id, "status": "abandoned", "reason": reason}
+    return format_response({"success": True, "plan_id": plan_id, "status": "abandoned", "reason": reason}, format)
 
 
 @mcp.tool()
-def suggest_next_work(path: Optional[str] = None) -> dict:
+def suggest_next_work(path: Optional[str] = None, format: str = "toon") -> dict:
     """Suggest what to work on next based on priorities and blockers.
 
     Analyzes all active/paused plans and returns recommendations
@@ -2774,7 +2535,7 @@ def suggest_next_work(path: Optional[str] = None) -> dict:
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     from .session import SessionManager
 
@@ -2794,12 +2555,13 @@ def suggest_next_work(path: Optional[str] = None) -> dict:
             "reason": s.reason,
         }
 
-    return {
+    result = {
         "blocked": [format_suggestion(s) for s in result["blocked"]],
         "ready": [format_suggestion(s) for s in result["ready"]],
         "recommended": format_suggestion(result["recommended"]) if result["recommended"] else None,
         "summary": result["summary"],
     }
+    return format_response(result, format)
 
 
 @mcp.tool()
@@ -2810,6 +2572,7 @@ def plan_update(
     tools: Optional[list[str]] = None,
     files: Optional[list[str]] = None,
     path: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """Update a plan's metadata.
 
@@ -2832,7 +2595,7 @@ def plan_update(
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     from .plans import PlanManager
     from .toon import get_progress_summary
@@ -2847,10 +2610,10 @@ def plan_update(
     )
 
     if not plan:
-        return {"error": "not_found", "message": f"Plan {plan_id} not found"}
+        return format_response({"error": "not_found", "message": f"Plan {plan_id} not found"}, format)
 
     progress = get_progress_summary(plan)
-    return {
+    result = {
         "success": True,
         "plan_id": plan_id,
         "title": plan.title,
@@ -2860,6 +2623,7 @@ def plan_update(
         "files": plan.files,
         "progress": progress,
     }
+    return format_response(result, format)
 
 
 @mcp.tool()
@@ -2867,6 +2631,7 @@ def quick_fix_note(
     description: str,
     importance: int = 2,
     path: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """Record a quick fix without creating a plan.
 
@@ -2886,25 +2651,26 @@ def quick_fix_note(
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     from .session import SessionManager
 
     session_mgr = SessionManager(db, project_id)
     session_mgr.quick_fix_note(description, importance)
 
-    return {
+    result = {
         "success": True,
         "message": f"Quick fix noted: {description}",
         "importance": importance,
     }
+    return format_response(result, format)
 
 
 # --- Memory Access ---
 
 
 @mcp.tool()
-def memory_get(path: Optional[str] = None) -> dict:
+def memory_get(path: Optional[str] = None, format: str = "toon") -> dict:
     """Get the current project memory.
 
     Returns condensed context from previous sessions including:
@@ -2924,12 +2690,12 @@ def memory_get(path: Optional[str] = None) -> dict:
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     memory_mgr = MemoryManager(db, project_id)
     memory = memory_mgr.get()
 
-    return {
+    result = {
         "current_work": {
             "ticket_id": memory.current_ticket_id,
             "ticket_title": memory.current_ticket_title,
@@ -2961,6 +2727,7 @@ def memory_get(path: Optional[str] = None) -> dict:
             "estimated_tokens": memory.estimate_tokens(),
         },
     }
+    return format_response(result, format)
 
 
 @mcp.tool()
@@ -2968,6 +2735,7 @@ def memory_add_discovery(
     content: str,
     importance: int = 2,
     path: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """Add a discovery to memory.
 
@@ -2990,16 +2758,16 @@ def memory_add_discovery(
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     memory_mgr = MemoryManager(db, project_id)
     memory_mgr.add_discovery(content, importance)
 
-    return {"success": True, "discovery": content, "importance": importance}
+    return format_response({"success": True, "discovery": content, "importance": importance}, format)
 
 
 @mcp.tool()
-def memory_add_blocker(blocker: str, path: Optional[str] = None) -> dict:
+def memory_add_blocker(blocker: str, path: Optional[str] = None, format: str = "toon") -> dict:
     """Add a blocker to memory.
 
     Args:
@@ -3012,16 +2780,16 @@ def memory_add_blocker(blocker: str, path: Optional[str] = None) -> dict:
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     memory_mgr = MemoryManager(db, project_id)
     memory_mgr.add_blocker(blocker)
 
-    return {"success": True, "blocker": blocker}
+    return format_response({"success": True, "blocker": blocker}, format)
 
 
 @mcp.tool()
-def memory_resolve_blocker(blocker: str, path: Optional[str] = None) -> dict:
+def memory_resolve_blocker(blocker: str, path: Optional[str] = None, format: str = "toon") -> dict:
     """Mark a blocker as resolved.
 
     Args:
@@ -3034,16 +2802,16 @@ def memory_resolve_blocker(blocker: str, path: Optional[str] = None) -> dict:
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     memory_mgr = MemoryManager(db, project_id)
     memory_mgr.remove_blocker(blocker)
 
-    return {"success": True, "resolved": blocker}
+    return format_response({"success": True, "resolved": blocker}, format)
 
 
 @mcp.tool()
-def memory_set_files(files: list[str], path: Optional[str] = None) -> dict:
+def memory_set_files(files: list[str], path: Optional[str] = None, format: str = "toon") -> dict:
     """Set the key files list in memory.
 
     Args:
@@ -3056,16 +2824,16 @@ def memory_set_files(files: list[str], path: Optional[str] = None) -> dict:
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     memory_mgr = MemoryManager(db, project_id)
     memory_mgr.set_files(files)
 
-    return {"success": True, "files": files}
+    return format_response({"success": True, "files": files}, format)
 
 
 @mcp.tool()
-def memory_set_tools(tools: list[str], path: Optional[str] = None) -> dict:
+def memory_set_tools(tools: list[str], path: Optional[str] = None, format: str = "toon") -> dict:
     """Set the available tools list in memory.
 
     Args:
@@ -3078,12 +2846,12 @@ def memory_set_tools(tools: list[str], path: Optional[str] = None) -> dict:
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     memory_mgr = MemoryManager(db, project_id)
     memory_mgr.set_tools(tools)
 
-    return {"success": True, "tools": tools}
+    return format_response({"success": True, "tools": tools}, format)
 
 
 # --- Unified Tickets (v2) ---
@@ -3098,6 +2866,7 @@ def unified_ticket_create(
     labels: Optional[list[str]] = None,
     tags: Optional[list[str]] = None,
     path: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """Create a unified ticket (local source).
 
@@ -3119,10 +2888,11 @@ def unified_ticket_create(
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     ticket_mgr = TicketManager(db, project_id)
-    ticket_id = ticket_mgr.create(
+    result = svc_unified_ticket_create(
+        ticket_manager=ticket_mgr,
         title=title,
         description=description,
         acceptance_criteria=acceptance_criteria,
@@ -3130,18 +2900,14 @@ def unified_ticket_create(
         labels=labels,
         tags=tags,
     )
-
-    ticket = ticket_mgr.get(ticket_id)
-    return {
-        "success": True,
-        "ticket": _format_unified_ticket(ticket),
-    }
+    return format_response(result, format)
 
 
 @mcp.tool()
 def unified_ticket_get(
     ticket_id: str,
     path: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """Get a unified ticket by ID or external ID.
 
@@ -3155,19 +2921,11 @@ def unified_ticket_get(
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     ticket_mgr = TicketManager(db, project_id)
-
-    # Try by ID first, then by external ID
-    ticket = ticket_mgr.get(ticket_id)
-    if not ticket:
-        ticket = ticket_mgr.get_by_external_id(ticket_id)
-
-    if not ticket:
-        return {"error": "not_found", "message": f"Ticket not found: {ticket_id}"}
-
-    return {"ticket": _format_unified_ticket(ticket)}
+    result = svc_unified_ticket_get(ticket_mgr, ticket_id)
+    return format_response(result, format)
 
 
 @mcp.tool()
@@ -3179,6 +2937,7 @@ def unified_ticket_list(
     limit: int = 20,
     offset: int = 0,
     path: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """List unified tickets with optional filtering.
 
@@ -3197,10 +2956,11 @@ def unified_ticket_list(
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     ticket_mgr = TicketManager(db, project_id)
-    tickets = ticket_mgr.list(
+    result = svc_unified_ticket_list(
+        ticket_manager=ticket_mgr,
         source=source,
         status=status,
         status_category=status_category,
@@ -3208,23 +2968,7 @@ def unified_ticket_list(
         limit=limit,
         offset=offset,
     )
-
-    return {
-        "tickets": [
-            {
-                "id": t.id,
-                "title": t.title,
-                "source": t.source,
-                "status": t.status,
-                "status_category": t.status_category,
-                "priority": t.priority,
-                "external_id": t.external_id,
-                "has_ac": t.has_ac,
-            }
-            for t in tickets
-        ],
-        "count": len(tickets),
-    }
+    return format_response(result, format)
 
 
 @mcp.tool()
@@ -3238,6 +2982,7 @@ def unified_ticket_update(
     labels: Optional[list[str]] = None,
     tags: Optional[list[str]] = None,
     path: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """Update a unified ticket.
 
@@ -3258,10 +3003,11 @@ def unified_ticket_update(
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     ticket_mgr = TicketManager(db, project_id)
-    ticket = ticket_mgr.update(
+    result = svc_unified_ticket_update(
+        ticket_manager=ticket_mgr,
         ticket_id=ticket_id,
         title=title,
         description=description,
@@ -3271,14 +3017,7 @@ def unified_ticket_update(
         labels=labels,
         tags=tags,
     )
-
-    if not ticket:
-        return {"error": "not_found", "message": f"Ticket not found: {ticket_id}"}
-
-    return {
-        "success": True,
-        "ticket": _format_unified_ticket(ticket),
-    }
+    return format_response(result, format)
 
 
 @mcp.tool()
@@ -3286,6 +3025,7 @@ def unified_ticket_link_external(
     ticket_id: str,
     external_item_id: str,
     path: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """Link a unified ticket to an external item.
 
@@ -3300,15 +3040,11 @@ def unified_ticket_link_external(
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     ticket_mgr = TicketManager(db, project_id)
-    success = ticket_mgr.link_external(ticket_id, external_item_id)
-
-    if not success:
-        return {"error": "link_failed", "message": "Could not link ticket to external item"}
-
-    return {"success": True, "ticket_id": ticket_id, "external_item_id": external_item_id}
+    result = svc_unified_ticket_link_external(ticket_mgr, ticket_id, external_item_id)
+    return format_response(result, format)
 
 
 @mcp.tool()
@@ -3318,6 +3054,7 @@ def unified_ticket_update_ac(
     status: str,
     evidence: Optional[str] = None,
     path: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """Update an acceptance criterion's status.
 
@@ -3334,20 +3071,11 @@ def unified_ticket_update_ac(
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     ticket_mgr = TicketManager(db, project_id)
-    success = ticket_mgr.update_ac_status(ticket_id, ac_index, status, evidence)
-
-    if not success:
-        return {"error": "update_failed", "message": "Could not update AC status"}
-
-    return {
-        "success": True,
-        "ticket_id": ticket_id,
-        "ac_index": ac_index,
-        "status": status,
-    }
+    result = svc_unified_ticket_update_ac(ticket_mgr, ticket_id, ac_index, status, evidence)
+    return format_response(result, format)
 
 
 @mcp.tool()
@@ -3355,6 +3083,7 @@ def unified_ticket_add_ac(
     ticket_id: str,
     text: str,
     path: Optional[str] = None,
+    format: str = "toon",
 ) -> dict:
     """Add an acceptance criterion to a ticket.
 
@@ -3369,45 +3098,11 @@ def unified_ticket_add_ac(
     try:
         db, project_id, context = _get_db_for_path(path)
     except Exception as e:
-        return {"error": "database_error", "message": str(e)}
+        return format_response({"error": "database_error", "message": str(e)}, format)
 
     ticket_mgr = TicketManager(db, project_id)
-    index = ticket_mgr.add_acceptance_criterion(ticket_id, text)
-
-    return {
-        "success": True,
-        "ticket_id": ticket_id,
-        "ac_index": index,
-        "text": text,
-    }
-
-
-def _format_unified_ticket(ticket: Ticket) -> dict:
-    """Format a unified Ticket for API response."""
-    return {
-        "id": ticket.id,
-        "title": ticket.title,
-        "source": ticket.source,
-        "external_id": ticket.external_id,
-        "external_url": ticket.external_url,
-        "description": ticket.description,
-        "status": ticket.status,
-        "status_category": ticket.status_category,
-        "priority": ticket.priority,
-        "acceptance_criteria": [
-            {
-                "index": ac.index,
-                "text": ac.text,
-                "status": ac.status,
-                "evidence": ac.evidence,
-            }
-            for ac in ticket.acceptance_criteria
-        ],
-        "labels": ticket.labels,
-        "tags": ticket.tags,
-        "created_at": ticket.created_at,
-        "updated_at": ticket.updated_at,
-    }
+    result = svc_unified_ticket_add_ac(ticket_mgr, ticket_id, text)
+    return format_response(result, format)
 
 
 def main():

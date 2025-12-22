@@ -1,12 +1,12 @@
 """Database schema definitions and migrations for semfora-pm local storage."""
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Initial schema (version 1)
 SCHEMA_V1 = """
 -- ============================================================
 -- PROJECTS TABLE
--- Auto-detected from .pm/config.yaml location
+-- Auto-detected from .pm/config.json location
 -- ============================================================
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
@@ -320,6 +320,74 @@ SELECT 'mem_' || id, id, CURRENT_TIMESTAMP
 FROM projects;
 """
 
+# Schema V5: Local-first ticket model
+SCHEMA_V5_MIGRATION = """
+-- ============================================================
+-- V5: Local-first tickets with optional external linkage
+-- Adds local ticket fields to unified tickets and migrates data
+-- ============================================================
+
+-- Add local ticket fields to unified tickets
+ALTER TABLE tickets ADD COLUMN parent_ticket_id TEXT REFERENCES tickets(id) ON DELETE SET NULL;
+ALTER TABLE tickets ADD COLUMN parent_external_item_id TEXT REFERENCES external_items(id) ON DELETE SET NULL;
+ALTER TABLE tickets ADD COLUMN order_index INTEGER DEFAULT 0;
+ALTER TABLE tickets ADD COLUMN completed_at TEXT;
+
+-- Ensure any existing local_tickets not yet copied are inserted
+INSERT OR IGNORE INTO tickets (
+    id, project_id, source, title, description, status, status_category,
+    priority, tags, created_at, updated_at, parent_external_item_id, order_index, completed_at
+)
+SELECT
+    id,
+    project_id,
+    'local',
+    title,
+    description,
+    status,
+    CASE
+        WHEN status = 'pending' THEN 'todo'
+        WHEN status = 'in_progress' THEN 'in_progress'
+        WHEN status = 'completed' THEN 'done'
+        WHEN status = 'canceled' THEN 'canceled'
+        WHEN status = 'orphaned' THEN 'canceled'
+        ELSE 'todo'
+    END,
+    priority,
+    tags,
+    created_at,
+    updated_at,
+    parent_ticket_id,
+    order_index,
+    completed_at
+FROM local_tickets;
+
+-- Backfill local ticket fields for existing unified tickets
+UPDATE tickets
+SET
+    parent_external_item_id = (SELECT parent_ticket_id FROM local_tickets lt WHERE lt.id = tickets.id),
+    order_index = (SELECT order_index FROM local_tickets lt WHERE lt.id = tickets.id),
+    completed_at = (SELECT completed_at FROM local_tickets lt WHERE lt.id = tickets.id),
+    status = (SELECT status FROM local_tickets lt WHERE lt.id = tickets.id),
+    status_category = CASE
+        WHEN (SELECT status FROM local_tickets lt WHERE lt.id = tickets.id) = 'pending' THEN 'todo'
+        WHEN (SELECT status FROM local_tickets lt WHERE lt.id = tickets.id) = 'in_progress' THEN 'in_progress'
+        WHEN (SELECT status FROM local_tickets lt WHERE lt.id = tickets.id) = 'completed' THEN 'done'
+        WHEN (SELECT status FROM local_tickets lt WHERE lt.id = tickets.id) = 'canceled' THEN 'canceled'
+        WHEN (SELECT status FROM local_tickets lt WHERE lt.id = tickets.id) = 'orphaned' THEN 'canceled'
+        ELSE 'todo'
+    END
+WHERE id IN (SELECT id FROM local_tickets);
+
+-- Drop legacy local_tickets table (data is now in tickets)
+DROP TABLE IF EXISTS local_tickets;
+
+-- Add indexes for new columns
+CREATE INDEX IF NOT EXISTS idx_tickets_parent ON tickets(parent_ticket_id);
+CREATE INDEX IF NOT EXISTS idx_tickets_parent_external ON tickets(parent_external_item_id);
+CREATE INDEX IF NOT EXISTS idx_tickets_order ON tickets(order_index);
+"""
+
 
 def get_migration_sql(from_version: int, to_version: int) -> list[str]:
     """Get SQL statements to migrate from one version to another.
@@ -344,5 +412,8 @@ def get_migration_sql(from_version: int, to_version: int) -> list[str]:
 
     if from_version < 4 <= to_version:
         migrations.append(SCHEMA_V4_MIGRATION)
+
+    if from_version < 5 <= to_version:
+        migrations.append(SCHEMA_V5_MIGRATION)
 
     return migrations

@@ -257,6 +257,37 @@ class PlanManager:
                 for row in rows
             ]
 
+    def count(
+        self,
+        ticket_id: Optional[str] = None,
+        status: Optional[PlanStatus] = None,
+    ) -> int:
+        """Count plans with optional filtering."""
+        conditions = ["project_id = ?"]
+        params: list = [self.project_id]
+
+        if ticket_id:
+            conditions.append("ticket_id = ?")
+            params.append(ticket_id)
+
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+
+        where_clause = " AND ".join(conditions)
+
+        with self.db.connection() as conn:
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*) as count
+                FROM plans p
+                WHERE {where_clause}
+                """,
+                params,
+            ).fetchone()
+
+        return int(row["count"]) if row else 0
+
     def search(self, query: str, limit: int = 10) -> list[PlanSummary]:
         """Search plans by title or content.
 

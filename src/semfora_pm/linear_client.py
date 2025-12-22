@@ -98,7 +98,7 @@ To authenticate, use one of these methods:
 2. Run auth setup:
    $ semfora-pm auth setup
 
-3. Create .pm/config.yaml in your project:
+3. Create .pm/config.json in your project:
    provider: linear
    linear:
      team_name: "Your Team"

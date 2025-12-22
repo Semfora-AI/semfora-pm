@@ -19,7 +19,15 @@ from .db import Database
 
 
 TicketSource = Literal["local", "linear", "jira"]
-TicketStatus = Literal["pending", "in_progress", "done", "canceled"]
+TicketStatus = Literal[
+    "pending",
+    "in_progress",
+    "completed",
+    "done",
+    "blocked",
+    "canceled",
+    "orphaned",
+]
 
 
 @dataclass
@@ -54,6 +62,8 @@ class Ticket:
     title: str
     source: TicketSource = "local"
     external_item_id: Optional[str] = None  # FK to external_items if linked
+    parent_ticket_id: Optional[str] = None  # FK to tickets if linked locally
+    parent_external_item_id: Optional[str] = None  # FK to external_items (parent)
 
     description: Optional[str] = None
     status: str = "pending"
@@ -66,10 +76,16 @@ class Ticket:
 
     created_at: str = ""
     updated_at: str = ""
+    order_index: int = 0
+    completed_at: Optional[str] = None
 
     # Denormalized from external_items when linked
     external_id: Optional[str] = None  # e.g., "SEM-123"
     external_url: Optional[str] = None
+    parent_external_id: Optional[str] = None
+    parent_external_title: Optional[str] = None
+    parent_external_epic_id: Optional[str] = None
+    parent_external_epic_name: Optional[str] = None
 
 
 @dataclass
@@ -104,7 +120,13 @@ class TicketManager:
         description: Optional[str] = None,
         acceptance_criteria: Optional[list[str]] = None,
         source: TicketSource = "local",
+        external_item_id: Optional[str] = None,
+        parent_ticket_id: Optional[str] = None,
+        parent_external_item_id: Optional[str] = None,
+        status: TicketStatus = "pending",
+        status_category: Optional[str] = "todo",
         priority: int = 2,
+        order_index: int = 0,
         labels: Optional[list[str]] = None,
         tags: Optional[list[str]] = None,
     ) -> str:
@@ -115,7 +137,13 @@ class TicketManager:
             description: Optional description
             acceptance_criteria: Optional list of AC text
             source: Source type (local, linear, jira)
+            external_item_id: External item UUID if linked
+            parent_ticket_id: Parent local ticket UUID if linked
+            parent_external_item_id: Parent external item UUID if linked
+            status: Initial status
+            status_category: Normalized status category
             priority: 0-4, higher = more important
+            order_index: Optional ordering index for local tickets
             labels: Optional labels
             tags: Optional local tags
 
@@ -135,21 +163,26 @@ class TicketManager:
             conn.execute(
                 """
                 INSERT INTO tickets (
-                    id, project_id, source, title, description,
-                    status, status_category, priority,
+                    id, project_id, source, external_item_id, parent_ticket_id,
+                    parent_external_item_id, title, description,
+                    status, status_category, priority, order_index,
                     acceptance_criteria, labels, tags,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     ticket_id,
                     self.project_id,
                     source,
+                    external_item_id,
+                    parent_ticket_id,
+                    parent_external_item_id,
                     title,
                     description,
-                    "pending",
-                    "todo",
+                    status,
+                    status_category,
                     priority,
+                    order_index,
                     json.dumps(ac_list) if ac_list else None,
                     json.dumps(labels) if labels else None,
                     json.dumps(tags) if tags else None,
@@ -172,9 +205,16 @@ class TicketManager:
         with self.db.connection() as conn:
             row = conn.execute(
                 """
-                SELECT t.*, e.provider_id, e.url as external_url
+                SELECT t.*,
+                       e.provider_id,
+                       e.url as external_url,
+                       pe.provider_id as parent_external_id,
+                       pe.title as parent_external_title,
+                       pe.epic_id as parent_external_epic_id,
+                       pe.epic_name as parent_external_epic_name
                 FROM tickets t
                 LEFT JOIN external_items e ON t.external_item_id = e.id
+                LEFT JOIN external_items pe ON t.parent_external_item_id = pe.id
                 WHERE t.id = ?
                 """,
                 (ticket_id,),
@@ -196,9 +236,16 @@ class TicketManager:
         with self.db.connection() as conn:
             row = conn.execute(
                 """
-                SELECT t.*, e.provider_id, e.url as external_url
+                SELECT t.*,
+                       e.provider_id,
+                       e.url as external_url,
+                       pe.provider_id as parent_external_id,
+                       pe.title as parent_external_title,
+                       pe.epic_id as parent_external_epic_id,
+                       pe.epic_name as parent_external_epic_name
                 FROM tickets t
                 JOIN external_items e ON t.external_item_id = e.id
+                LEFT JOIN external_items pe ON t.parent_external_item_id = pe.id
                 WHERE e.provider_id = ? AND t.project_id = ?
                 """,
                 (external_id, self.project_id),
@@ -277,6 +324,44 @@ class TicketManager:
                 for row in rows
             ]
 
+    def count(
+        self,
+        source: Optional[TicketSource] = None,
+        status: Optional[str] = None,
+        status_category: Optional[str] = None,
+        priority: Optional[int] = None,
+    ) -> int:
+        """Count tickets with optional filtering."""
+        conditions = ["t.project_id = ?"]
+        params: list = [self.project_id]
+
+        if source:
+            conditions.append("t.source = ?")
+            params.append(source)
+        if status:
+            conditions.append("t.status = ?")
+            params.append(status)
+        if status_category:
+            conditions.append("t.status_category = ?")
+            params.append(status_category)
+        if priority is not None:
+            conditions.append("t.priority = ?")
+            params.append(priority)
+
+        where_clause = " AND ".join(conditions)
+
+        with self.db.connection() as conn:
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*) as count
+                FROM tickets t
+                WHERE {where_clause}
+                """,
+                params,
+            ).fetchone()
+
+        return int(row["count"]) if row else 0
+
     def update(
         self,
         ticket_id: str,
@@ -287,6 +372,10 @@ class TicketManager:
         priority: Optional[int] = None,
         labels: Optional[list[str]] = None,
         tags: Optional[list[str]] = None,
+        external_item_id: Optional[str] = None,
+        parent_ticket_id: Optional[str] = None,
+        parent_external_item_id: Optional[str] = None,
+        order_index: Optional[int] = None,
     ) -> Optional[Ticket]:
         """Update a ticket.
 
@@ -299,6 +388,10 @@ class TicketManager:
             priority: New priority
             labels: New labels
             tags: New tags
+            external_item_id: External item UUID if linked
+            parent_ticket_id: Parent local ticket UUID
+            parent_external_item_id: Parent external item UUID
+            order_index: New order index
 
         Returns:
             Updated Ticket, or None if not found
@@ -315,6 +408,11 @@ class TicketManager:
         if status is not None:
             updates.append("status = ?")
             params.append(status)
+            if status == "completed":
+                updates.append("completed_at = ?")
+                params.append(datetime.utcnow().isoformat())
+            elif status != "completed":
+                updates.append("completed_at = NULL")
         if status_category is not None:
             updates.append("status_category = ?")
             params.append(status_category)
@@ -327,6 +425,18 @@ class TicketManager:
         if tags is not None:
             updates.append("tags = ?")
             params.append(json.dumps(tags))
+        if external_item_id is not None:
+            updates.append("external_item_id = ?")
+            params.append(external_item_id)
+        if parent_ticket_id is not None:
+            updates.append("parent_ticket_id = ?")
+            params.append(parent_ticket_id or None)
+        if parent_external_item_id is not None:
+            updates.append("parent_external_item_id = ?")
+            params.append(parent_external_item_id or None)
+        if order_index is not None:
+            updates.append("order_index = ?")
+            params.append(order_index)
 
         if not updates:
             return self.get(ticket_id)
@@ -372,12 +482,88 @@ class TicketManager:
             result = conn.execute(
                 """
                 UPDATE tickets
-                SET external_item_id = ?, source = 'linear', updated_at = ?
+                SET external_item_id = ?, updated_at = ?
                 WHERE id = ? AND project_id = ?
                 """,
                 (external_item_id, now, ticket_id, self.project_id),
             )
             return result.rowcount > 0
+
+    def upsert_external(
+        self,
+        external_item_id: str,
+        title: str,
+        description: Optional[str],
+        status: Optional[str],
+        status_category: Optional[str],
+        priority: Optional[int],
+        labels: Optional[list[str]],
+    ) -> str:
+        """Create or update a ticket row for an external item.
+
+        Does not overwrite local-origin tickets.
+        """
+        now = datetime.utcnow().isoformat()
+        labels_json = json.dumps(labels) if labels is not None else None
+
+        with self.db.transaction() as conn:
+            existing = conn.execute(
+                """
+                SELECT id, source
+                FROM tickets
+                WHERE project_id = ? AND external_item_id = ?
+                """,
+                (self.project_id, external_item_id),
+            ).fetchone()
+
+            if existing:
+                if existing["source"] != "local":
+                    conn.execute(
+                        """
+                        UPDATE tickets
+                        SET title = ?, description = ?, status = ?, status_category = ?,
+                            priority = ?, labels = ?, updated_at = ?
+                        WHERE id = ? AND project_id = ?
+                        """,
+                        (
+                            title,
+                            description,
+                            status,
+                            status_category,
+                            priority,
+                            labels_json,
+                            now,
+                            existing["id"],
+                            self.project_id,
+                        ),
+                    )
+                return existing["id"]
+
+            ticket_id = str(uuid.uuid4())
+            conn.execute(
+                """
+                INSERT INTO tickets (
+                    id, project_id, source, external_item_id,
+                    title, description, status, status_category,
+                    priority, labels, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ticket_id,
+                    self.project_id,
+                    "linear",
+                    external_item_id,
+                    title,
+                    description,
+                    status,
+                    status_category,
+                    priority,
+                    labels_json,
+                    now,
+                    now,
+                ),
+            )
+            return ticket_id
 
     def update_ac_status(
         self,
@@ -458,11 +644,82 @@ class TicketManager:
             True if deleted
         """
         with self.db.transaction() as conn:
+            conn.execute(
+                """
+                DELETE FROM dependencies
+                WHERE (source_type = 'local' AND source_id = ?)
+                   OR (target_type = 'local' AND target_id = ?)
+                """,
+                (ticket_id, ticket_id),
+            )
             result = conn.execute(
                 "DELETE FROM tickets WHERE id = ? AND project_id = ?",
                 (ticket_id, self.project_id),
             )
             return result.rowcount > 0
+
+    def list_local(
+        self,
+        parent_ticket_id: Optional[str] = None,
+        parent_external_item_id: Optional[str] = None,
+        epic_id: Optional[str] = None,
+        status: Optional[str] = None,
+        tags: Optional[list[str]] = None,
+        include_completed: bool = False,
+    ) -> list[Ticket]:
+        """List local tickets with optional filters."""
+        conditions = ["t.project_id = ?", "t.source = 'local'"]
+        params = [self.project_id]
+
+        if parent_ticket_id:
+            conditions.append("t.parent_ticket_id = ?")
+            params.append(parent_ticket_id)
+
+        if parent_external_item_id:
+            conditions.append("t.parent_external_item_id = ?")
+            params.append(parent_external_item_id)
+
+        if epic_id:
+            conditions.append("pe.epic_id = ?")
+            params.append(epic_id)
+
+        if status:
+            conditions.append("t.status = ?")
+            params.append(status)
+
+        if not include_completed:
+            conditions.append("t.status NOT IN ('completed', 'canceled', 'orphaned')")
+
+        if tags:
+            tag_conditions = []
+            for tag in tags:
+                tag_conditions.append("t.tags LIKE ?")
+                params.append(f'%\"{tag}\"%')
+            if tag_conditions:
+                conditions.append(f"({' OR '.join(tag_conditions)})")
+
+        where_clause = " AND ".join(conditions)
+
+        with self.db.connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT t.*,
+                       e.provider_id,
+                       e.url as external_url,
+                       pe.provider_id as parent_external_id,
+                       pe.title as parent_external_title,
+                       pe.epic_id as parent_external_epic_id,
+                       pe.epic_name as parent_external_epic_name
+                FROM tickets t
+                LEFT JOIN external_items e ON t.external_item_id = e.id
+                LEFT JOIN external_items pe ON t.parent_external_item_id = pe.id
+                WHERE {where_clause}
+                ORDER BY t.priority DESC, t.order_index ASC, t.created_at ASC
+                """,
+                params,
+            ).fetchall()
+
+            return [self._row_to_ticket(row) for row in rows]
 
     def search(self, query: str, limit: int = 10) -> list[TicketSummary]:
         """Search tickets by title or description.
@@ -524,6 +781,8 @@ class TicketManager:
             title=row["title"],
             source=row["source"],
             external_item_id=row["external_item_id"],
+            parent_ticket_id=row_dict.get("parent_ticket_id"),
+            parent_external_item_id=row_dict.get("parent_external_item_id"),
             description=row["description"],
             status=row["status"],
             status_category=row["status_category"],
@@ -533,6 +792,12 @@ class TicketManager:
             tags=tags,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            order_index=row_dict.get("order_index", 0),
+            completed_at=row_dict.get("completed_at"),
             external_id=row_dict.get("provider_id"),
             external_url=row_dict.get("external_url"),
+            parent_external_id=row_dict.get("parent_external_id"),
+            parent_external_title=row_dict.get("parent_external_title"),
+            parent_external_epic_id=row_dict.get("parent_external_epic_id"),
+            parent_external_epic_name=row_dict.get("parent_external_epic_name"),
         )

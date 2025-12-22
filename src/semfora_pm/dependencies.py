@@ -348,9 +348,10 @@ class DependencyManager:
                     """
                     SELECT t.id, t.title, t.status, t.priority,
                            e.provider_id as linked_ticket_id, e.epic_id
-                    FROM local_tickets t
-                    LEFT JOIN external_items e ON t.parent_ticket_id = e.id
-                    WHERE t.project_id = ? AND t.status IN ('pending', 'in_progress')
+                    FROM tickets t
+                    LEFT JOIN external_items e ON t.parent_external_item_id = e.id
+                    WHERE t.project_id = ? AND t.source = 'local'
+                      AND t.status IN ('pending', 'in_progress')
                     ORDER BY t.priority DESC, t.created_at ASC
                     """,
                     (self.project_id,),
@@ -378,7 +379,7 @@ class DependencyManager:
         """Get basic info about an item."""
         if item_type == "local":
             row = conn.execute(
-                "SELECT title, status FROM local_tickets WHERE id = ?",
+                "SELECT title, status FROM tickets WHERE id = ? AND source = 'local'",
                 (item_id,),
             ).fetchone()
         else:

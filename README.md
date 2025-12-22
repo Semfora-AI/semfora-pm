@@ -30,6 +30,11 @@ semfora-pm sprint status
 - **AI-ready** - MCP server for Claude Code and other AI assistants
 - **CLI first** - Fast terminal interface for developers
 
+## Data model
+
+Tickets are local-first and stored in SQLite (`.pm/cache.db`). External provider data
+(e.g., Linear) is optional and linked via cached external items when available.
+
 ## Installation
 
 ### Prerequisites
@@ -84,7 +89,7 @@ cd your-project
 semfora-pm init
 ```
 
-This creates a `.pm/config.yaml` linking your project to Linear.
+This creates a `.pm/config.json` linking your project to Linear.
 
 ## Basic Usage
 

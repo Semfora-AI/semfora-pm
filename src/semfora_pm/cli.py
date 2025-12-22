@@ -3,19 +3,36 @@
 import typer
 from pathlib import Path
 from rich.console import Console
-from rich.table import Table
-from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from typing import Optional
 
 from .linear_client import LinearClient, LinearConfig, AuthenticationError
-from .models.ticket import Ticket, load_tickets, save_tickets, Component
+from .output import format_response, render_cli
+from .services import resolve_context_info, scan_contexts
+from .services.linear_tickets import (
+    list_tickets as svc_list_tickets,
+    get_ticket as svc_get_ticket,
+    search_tickets as svc_search_tickets,
+)
 from .pm_config import (
     resolve_context,
     create_pm_config,
-    scan_pm_directories,
-    get_context_help_message,
-    PMContext,
+)
+from .services.projects import (
+    list_projects as svc_list_projects,
+    list_labels as svc_list_labels,
+    create_project as svc_create_project,
+    add_tickets_to_project as svc_add_tickets_to_project,
+    describe_project as svc_describe_project,
+    show_project as svc_show_project,
+)
+from .services.labels import audit_labels as svc_audit_labels
+from .services.links import link_blocks as svc_link_blocks, link_related as svc_link_related
+from .services.sprints import (
+    sprint_status as svc_sprint_status,
+    sprint_status_aggregated as svc_sprint_status_aggregated,
+    sprint_suggest as svc_sprint_suggest,
+    sprint_plan as svc_sprint_plan,
 )
 
 app = typer.Typer(
@@ -23,10 +40,6 @@ app = typer.Typer(
     help="Semfora Project Management - Linear integration for ticket management",
 )
 console = Console()
-
-# Default paths
-TICKETS_DIR = Path(__file__).parent.parent.parent.parent / "tickets"
-
 
 def get_client(path: Optional[Path] = None) -> LinearClient:
     """Get configured Linear client or exit with error.
@@ -50,7 +63,7 @@ def get_client(path: Optional[Path] = None) -> LinearClient:
             console.print("")
             console.print("To configure, use one of these methods:")
             console.print("")
-            console.print("1. Create .pm/config.yaml in your project:")
+            console.print("1. Create .pm/config.json in your project:")
             console.print("   [cyan]semfora-pm init[/cyan]")
             console.print("")
             console.print("2. Set environment variable:")
@@ -68,32 +81,6 @@ def get_client(path: Optional[Path] = None) -> LinearClient:
 
 
 # ============================================================================
-# TUI Command
-# ============================================================================
-
-
-@app.command("tui")
-def launch_tui(
-    path: Optional[Path] = typer.Option(None, "--path", "-p", help="Directory for PM context"),
-):
-    """Launch the interactive Terminal User Interface.
-
-    Provides a rich terminal interface for managing local plans,
-    viewing dependencies, and interacting with connected providers.
-
-    Key bindings:
-    - d: Dashboard view
-    - p: Plans list
-    - g: Dependency graph
-    - n: New plan
-    - q: Quit
-    """
-    from .tui import run_tui
-
-    run_tui(path)
-
-
-# ============================================================================
 # Context Commands
 # ============================================================================
 
@@ -101,6 +88,7 @@ def launch_tui(
 @app.command("context")
 def show_context(
     path: Optional[Path] = typer.Option(None, "--path", "-p", help="Path to check context for"),
+    output_format: str = typer.Option("toon", "--format", "-f", help="Output format (toon|json|text)"),
 ):
     """Show detected PM context for current or specified directory.
 
@@ -110,13 +98,9 @@ def show_context(
     - Authentication status
     """
     target_path = path or Path.cwd()
-    context = resolve_context(target_path)
-
-    console.print(Panel(
-        get_context_help_message(context),
-        title=f"PM Context: {target_path}",
-        border_style="blue",
-    ))
+    data = resolve_context_info(target_path)
+    response = format_response(data, output_format)
+    console.print(render_cli(response))
 
 
 @app.command("init")
@@ -126,7 +110,7 @@ def init_config(
     project_name: Optional[str] = typer.Option(None, "--project", help="Linear project name"),
     api_key_env: Optional[str] = typer.Option(None, "--api-key-env", help="Environment variable for API key"),
 ):
-    """Initialize .pm/config.yaml in current or specified directory.
+    """Initialize .pm/config.json in current or specified directory.
 
     Creates a .pm/ folder with configuration for Linear integration.
     This enables directory-based context detection for multi-project workspaces.
@@ -138,7 +122,7 @@ def init_config(
         raise typer.Exit(1)
 
     # Check if config already exists
-    existing_config = target_path / ".pm" / "config.yaml"
+    existing_config = target_path / ".pm" / "config.json"
     if existing_config.exists():
         if not typer.confirm(f"Config already exists at {existing_config}. Overwrite?"):
             raise typer.Exit(0)
@@ -187,47 +171,21 @@ def init_config(
 def scan_directories(
     path: Optional[Path] = typer.Option(None, "--path", "-p", help="Base directory to scan"),
     max_depth: int = typer.Option(3, "--depth", "-d", help="Maximum depth to scan"),
+    output_format: str = typer.Option("toon", "--format", "-f", help="Output format (toon|json|text)"),
 ):
     """Scan directory tree for .pm/ configurations.
 
     Useful for discovering all PM-configured projects in a workspace.
     """
     target_path = Path(path) if path else Path.cwd()
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=True,
-    ) as progress:
-        progress.add_task(f"Scanning {target_path}...", total=None)
-        results = scan_pm_directories(target_path, max_depth)
-
-    if not results:
-        console.print("[yellow]No .pm/ configurations found.[/yellow]")
-        console.print(f"\nTo create one, run: [cyan]semfora-pm init --path <directory>[/cyan]")
-        raise typer.Exit(0)
-
-    table = Table(title="PM Configurations Found")
-    table.add_column("Path", style="cyan")
-    table.add_column("Provider", style="yellow")
-    table.add_column("Team", style="magenta")
-    table.add_column("Project", style="blue")
-
-    for info in results:
-        team_str = info.team_name or info.team_id or "—"
-        project_str = info.project_name or info.project_id or "—"
-        rel_path = info.path.relative_to(target_path) if info.path != target_path else Path(".")
-
-        table.add_row(
-            str(rel_path),
-            info.provider,
-            team_str,
-            project_str,
-        )
-
-    console.print(table)
-    console.print(f"\n[dim]Found {len(results)} configuration(s)[/dim]")
+    results = scan_contexts(target_path, max_depth)
+    payload = {
+        "base_path": str(target_path),
+        "count": len(results),
+        "directories": results,
+    }
+    response = format_response(payload, output_format)
+    console.print(render_cli(response))
 
 
 # ============================================================================
@@ -311,722 +269,52 @@ def list_tickets(
     limit: int = typer.Option(50, "--limit", help="Maximum tickets to show"),
     sprint: bool = typer.Option(False, "--sprint", help="Show only current sprint tickets (Todo/In Progress/In Review)"),
     path: Optional[Path] = typer.Option(None, "--path", help="Path for context detection"),
+    offset: int = typer.Option(0, "--offset", help="Skip first N tickets for pagination"),
+    output_format: str = typer.Option("toon", "--format", "-f", help="Output format (toon|json|text)"),
 ):
     """List tickets from Linear with rich details.
 
     Shows ticket ID, title, state, priority, estimate, labels, and a short description.
     """
-    client = get_client(path)
-
-    # Get team_id from context or legacy config
-    context = resolve_context(path)
-    team_id = context.team_id
-    if not team_id and context.team_name:
-        team_id = client.get_team_id_by_name(context.team_name)
-
-    if not team_id:
-        config = LinearConfig.load()
-        team_id = config.team_id if config else None
-
-    if not team_id:
-        console.print("[red]Error:[/red] No default team configured.")
-        console.print("Run: [cyan]semfora-pm auth setup[/cyan]")
-        raise typer.Exit(1)
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=True,
-    ) as progress:
-        progress.add_task("Fetching tickets from Linear...", total=None)
-        issues = client.get_team_issues(team_id, limit=limit * 2)  # Fetch extra for filtering
-
-    # Apply filters
-    if sprint:
-        sprint_states = {"Todo", "In Progress", "In Review"}
-        issues = [i for i in issues if i["state"]["name"] in sprint_states]
-    elif state:
-        issues = [i for i in issues if i["state"]["name"].lower() == state.lower()]
-
-    if label:
-        issues = [
-            i for i in issues
-            if any(l["name"].lower() == label.lower() for l in i.get("labels", {}).get("nodes", []))
-        ]
-
-    if priority is not None:
-        issues = [i for i in issues if i.get("priority") == priority]
-
-    # Limit results
-    issues = issues[:limit]
-
-    if not issues:
-        console.print("[yellow]No tickets found matching filters.[/yellow]")
-        raise typer.Exit(0)
-
-    # Priority mapping
-    priority_map = {0: "None", 1: "Urgent", 2: "High", 3: "Medium", 4: "Low"}
-    priority_colors = {0: "dim", 1: "red", 2: "yellow", 3: "blue", 4: "dim"}
-
-    table = Table(title="Linear Tickets")
-    table.add_column("ID", style="cyan", no_wrap=True)
-    table.add_column("Title", style="white", max_width=45)
-    table.add_column("State", style="magenta", no_wrap=True)
-    table.add_column("Priority", no_wrap=True)
-    table.add_column("Est", style="blue", justify="center", no_wrap=True)
-    table.add_column("Labels", style="dim", max_width=30)
-    table.add_column("Description", style="dim", max_width=40)
-
-    for issue in issues:
-        # Format priority with color
-        pri = issue.get("priority", 0)
-        pri_str = f"[{priority_colors.get(pri, 'white')}]{priority_map.get(pri, str(pri))}[/]"
-
-        # Format labels (first 3)
-        labels = [l["name"] for l in issue.get("labels", {}).get("nodes", [])][:3]
-        labels_str = ", ".join(labels) if labels else "—"
-
-        # Format estimate
-        estimate = issue.get("estimate")
-        est_str = str(estimate) if estimate else "—"
-
-        # Short description (first 60 chars, first line only)
-        desc = issue.get("description") or ""
-        desc_short = desc.split("\n")[0][:60]
-        if len(desc) > 60 or "\n" in desc:
-            desc_short += "..."
-
-        # Title (truncate if needed)
-        title = issue["title"]
-        if len(title) > 45:
-            title = title[:42] + "..."
-
-        table.add_row(
-            issue["identifier"],
-            title,
-            issue["state"]["name"],
-            pri_str,
-            est_str,
-            labels_str,
-            desc_short or "—",
-        )
-
-    console.print(table)
-    console.print(f"\n[dim]Total: {len(issues)} tickets[/dim]")
-
-    # Show filter hints
-    if not any([state, label, priority, sprint]):
-        console.print("[dim]Use --sprint to show active sprint tickets, or -s/--state to filter by state[/dim]")
+    result = svc_list_tickets(
+        path=path,
+        state=state,
+        label=label,
+        priority=priority,
+        sprint_only=sprint,
+        limit=limit,
+        offset=offset,
+    )
+    response = format_response(result, output_format)
+    console.print(render_cli(response))
 
 
 @app.command("show")
 def show_ticket(
     identifier: str = typer.Argument(..., help="Linear ticket identifier (e.g., SEM-123)"),
     path: Optional[Path] = typer.Option(None, "--path", help="Path for context detection"),
+    output_format: str = typer.Option("toon", "--format", "-f", help="Output format (toon|json|text)"),
 ):
     """Show full ticket details from Linear.
 
     Displays all available information for a ticket including full description,
     labels, assignee, dates, and related data.
     """
-    client = get_client(path)
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=True,
-    ) as progress:
-        progress.add_task(f"Fetching {identifier}...", total=None)
-        issue = client.get_issue_full(identifier)
-
-    if not issue:
-        console.print(f"[red]Ticket not found:[/red] {identifier}")
-        raise typer.Exit(1)
-
-    # Priority mapping
-    priority_map = {0: "None", 1: "Urgent", 2: "High", 3: "Medium", 4: "Low"}
-    pri = issue.get("priority", 0)
-    pri_str = priority_map.get(pri, str(pri))
-
-    # Format labels
-    labels = [l["name"] for l in issue.get("labels", {}).get("nodes", [])]
-    labels_str = ", ".join(labels) if labels else "—"
-
-    # Format assignee
-    assignee = issue.get("assignee")
-    assignee_str = assignee["name"] if assignee else "Unassigned"
-
-    # Format dates
-    created = issue.get("createdAt", "")[:10] if issue.get("createdAt") else "—"
-    updated = issue.get("updatedAt", "")[:10] if issue.get("updatedAt") else "—"
-
-    # Format project
-    project = issue.get("project")
-    project_str = project["name"] if project else "—"
-
-    # Format cycle
-    cycle = issue.get("cycle")
-    cycle_str = cycle["name"] if cycle else "—"
-
-    # Format parent issue
-    parent = issue.get("parent")
-    parent_str = f"{parent['identifier']}: {parent['title'][:30]}" if parent else "—"
-
-    # Format sub-issues
-    sub_issues = issue.get("children", {}).get("nodes", [])
-    sub_issues_str = ""
-    if sub_issues:
-        sub_issues_str = "\n".join(f"  • {s['identifier']}: {s['title'][:40]}" for s in sub_issues[:5])
-        if len(sub_issues) > 5:
-            sub_issues_str += f"\n  [dim]...and {len(sub_issues) - 5} more[/dim]"
-
-    # Format relations
-    relations = issue.get("relations", {}).get("nodes", [])
-    blocks = [r for r in relations if r.get("type") == "blocks"]
-    blocked_by = [r for r in relations if r.get("type") == "blocked"]
-    related = [r for r in relations if r.get("type") == "related"]
-
-    def format_relations(rels: list) -> str:
-        if not rels:
-            return "—"
-        items = []
-        for r in rels[:3]:
-            related_issue = r.get("relatedIssue", {})
-            items.append(f"{related_issue.get('identifier', '?')}: {related_issue.get('title', '')[:30]}")
-        return "\n  ".join(items)
-
-    panel_content = f"""[bold]{issue['title']}[/bold]
-
-[cyan]State:[/cyan] {issue['state']['name']}
-[cyan]Priority:[/cyan] {pri_str}
-[cyan]Estimate:[/cyan] {issue.get('estimate') or '—'} points
-[cyan]Assignee:[/cyan] {assignee_str}
-[cyan]Labels:[/cyan] {labels_str}
-
-[cyan]Project:[/cyan] {project_str}
-[cyan]Cycle:[/cyan] {cycle_str}
-[cyan]Parent:[/cyan] {parent_str}
-
-[cyan]Created:[/cyan] {created}
-[cyan]Updated:[/cyan] {updated}
-
-[cyan]URL:[/cyan] {issue.get('url', '—')}
-"""
-
-    if sub_issues_str:
-        panel_content += f"\n[cyan]Sub-issues:[/cyan]\n{sub_issues_str}\n"
-
-    if blocks:
-        panel_content += f"\n[cyan]Blocks:[/cyan]\n  {format_relations(blocks)}\n"
-    if blocked_by:
-        panel_content += f"\n[cyan]Blocked by:[/cyan]\n  {format_relations(blocked_by)}\n"
-    if related:
-        panel_content += f"\n[cyan]Related:[/cyan]\n  {format_relations(related)}\n"
-
-    # Description
-    desc = issue.get("description") or "No description"
-    panel_content += f"\n[bold]Description:[/bold]\n{desc}"
-
-    console.print(Panel(panel_content, title=f"Ticket: {issue['identifier']}", border_style="blue"))
+    result = svc_get_ticket(identifier, path=path)
+    response = format_response(result, output_format)
+    console.print(render_cli(response))
 
 
 @app.command("get-ticket")
 def get_ticket_json(
     identifier: str = typer.Argument(..., help="Linear ticket identifier (e.g., SEM-123)"),
     path: Optional[Path] = typer.Option(None, "--path", help="Path for context detection"),
-    format: str = typer.Option("json", "--format", "-f", help="Output format (json)"),
+    output_format: str = typer.Option("toon", "--format", "-f", help="Output format (toon|json|text)"),
 ):
     """Get ticket details as JSON (for programmatic use by AI agents)."""
-    import json
-
-    client = get_client(path)
-    issue = client.get_issue_full(identifier)
-
-    if not issue:
-        print(json.dumps({"error": f"Ticket not found: {identifier}"}))
-        raise typer.Exit(1)
-
-    # Priority mapping
-    priority_map = {0: "None", 1: "Urgent", 2: "High", 3: "Medium", 4: "Low"}
-
-    # Extract structured data
-    result = {
-        "identifier": issue.get("identifier"),
-        "title": issue.get("title"),
-        "description": issue.get("description") or "",
-        "state": issue.get("state", {}).get("name"),
-        "priority": priority_map.get(issue.get("priority", 0), "None"),
-        "priority_number": issue.get("priority", 0),
-        "estimate": issue.get("estimate"),
-        "labels": [l["name"] for l in issue.get("labels", {}).get("nodes", [])],
-        "assignee": issue.get("assignee", {}).get("name") if issue.get("assignee") else None,
-        "project": issue.get("project", {}).get("name") if issue.get("project") else None,
-        "cycle": issue.get("cycle", {}).get("name") if issue.get("cycle") else None,
-        "created_at": issue.get("createdAt"),
-        "updated_at": issue.get("updatedAt"),
-        "parent": {
-            "identifier": issue.get("parent", {}).get("identifier"),
-            "title": issue.get("parent", {}).get("title"),
-        } if issue.get("parent") else None,
-        "sub_issues": [
-            {"identifier": s["identifier"], "title": s["title"], "state": s.get("state", {}).get("name")}
-            for s in issue.get("children", {}).get("nodes", [])
-        ],
-        "blocks": [
-            {"identifier": r.get("relatedIssue", {}).get("identifier"), "title": r.get("relatedIssue", {}).get("title")}
-            for r in issue.get("relations", {}).get("nodes", [])
-            if r.get("type") == "blocks"
-        ],
-        "blocked_by": [
-            {"identifier": r.get("relatedIssue", {}).get("identifier"), "title": r.get("relatedIssue", {}).get("title")}
-            for r in issue.get("relations", {}).get("nodes", [])
-            if r.get("type") == "blocked"
-        ],
-    }
-
-    print(json.dumps(result))
-
-
-# ============================================================================
-# Sync Commands
-# ============================================================================
-
-sync_app = typer.Typer(help="[DEPRECATED] Sync commands - Linear is now source of truth", deprecated=True)
-app.add_typer(sync_app, name="sync")
-
-
-@sync_app.command("push")
-def sync_push(
-    component: Optional[str] = typer.Option(None, "-c", "--component", help="Only sync specific component"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be synced without making changes"),
-    project_name: Optional[str] = typer.Option(None, "-p", "--project", help="Linear project name to add issues to"),
-):
-    """Push tickets to Linear (create new, update existing)."""
-    client = get_client()
-    config = LinearConfig.load()
-
-    if not config.team_id:
-        console.print("[red]Error:[/red] No default team configured.")
-        console.print("Run: [cyan]semfora-pm auth setup[/cyan]")
-        raise typer.Exit(1)
-
-    tickets = load_tickets(TICKETS_DIR)
-
-    if component:
-        tickets = [t for t in tickets if t.component.value == component]
-
-    if not tickets:
-        console.print("[yellow]No tickets to sync.[/yellow]")
-        raise typer.Exit(0)
-
-    # Get project ID if specified
-    project_id = None
-    if project_name:
-        projects = client.get_projects(config.team_id)
-        project = next((p for p in projects if p["name"].lower() == project_name.lower()), None)
-        if project:
-            project_id = project["id"]
-            console.print(f"[dim]Adding to project: {project['name']}[/dim]")
-        else:
-            console.print(f"[yellow]Warning: Project '{project_name}' not found. Creating issues without project.[/yellow]")
-
-    # Get workflow states
-    states = client.get_team_states(config.team_id)
-
-    # Categorize tickets
-    to_create = [t for t in tickets if not t.linear_id]
-    to_update = [t for t in tickets if t.linear_id]
-
-    console.print(f"\n[bold]Sync Summary:[/bold]")
-    console.print(f"  New tickets: {len(to_create)}")
-    console.print(f"  Existing tickets: {len(to_update)}")
-
-    if dry_run:
-        console.print("\n[yellow]Dry run mode - no changes will be made[/yellow]")
-        for ticket in to_create:
-            console.print(f"  [green]CREATE[/green] {ticket.id}: {ticket.title}")
-        for ticket in to_update:
-            console.print(f"  [blue]UPDATE[/blue] {ticket.id}: {ticket.title}")
-        raise typer.Exit(0)
-
-    if not to_create and not to_update:
-        console.print("\n[green]Everything is in sync![/green]")
-        raise typer.Exit(0)
-
-    # Confirm
-    if not typer.confirm(f"\nProceed with syncing {len(to_create)} new and {len(to_update)} existing tickets?"):
-        raise typer.Exit(0)
-
-    # Track which files need updating
-    updated_tickets: dict[str, list[Ticket]] = {}  # filepath -> tickets
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-    ) as progress:
-        # Create new tickets
-        if to_create:
-            task = progress.add_task(f"Creating {len(to_create)} tickets...", total=len(to_create))
-            for ticket in to_create:
-                try:
-                    # Map status to state ID
-                    state_id = states.get(ticket.status.value)
-
-                    issue = client.create_issue(
-                        title=ticket.title,
-                        description=ticket.description,
-                        team_id=config.team_id,
-                        priority=ticket.priority.to_linear(),
-                        labels=ticket.labels,
-                        estimate=ticket.estimate,
-                        state_id=state_id,
-                        project_id=project_id,
-                    )
-
-                    ticket.linear_id = issue["id"]
-                    ticket.linear_url = issue["url"]
-
-                    # Track for saving
-                    filepath = TICKETS_DIR / f"{ticket.component.value}.yaml"
-                    if filepath not in updated_tickets:
-                        updated_tickets[filepath] = []
-                    updated_tickets[filepath].append(ticket)
-
-                    progress.console.print(f"  [green]✓[/green] Created {issue['identifier']}: {ticket.title[:40]}")
-
-                except Exception as e:
-                    progress.console.print(f"  [red]✗[/red] Failed {ticket.id}: {e}")
-
-                progress.advance(task)
-
-        # Update existing tickets
-        if to_update:
-            task = progress.add_task(f"Updating {len(to_update)} tickets...", total=len(to_update))
-            for ticket in to_update:
-                try:
-                    state_id = states.get(ticket.status.value)
-
-                    client.update_issue(
-                        issue_id=ticket.linear_id,
-                        title=ticket.title,
-                        description=ticket.description,
-                        priority=ticket.priority.to_linear(),
-                        labels=ticket.labels,
-                        estimate=ticket.estimate,
-                        state_id=state_id,
-                    )
-
-                    progress.console.print(f"  [blue]✓[/blue] Updated {ticket.linear_id[:8]}: {ticket.title[:40]}")
-
-                except Exception as e:
-                    progress.console.print(f"  [red]✗[/red] Failed {ticket.id}: {e}")
-
-                progress.advance(task)
-
-    # Save updated tickets back to YAML
-    if updated_tickets:
-        console.print("\n[dim]Saving Linear IDs to YAML files...[/dim]")
-        for filepath, file_tickets in updated_tickets.items():
-            # Load all tickets for this file, update the ones we synced
-            all_tickets = load_tickets(TICKETS_DIR)
-            component = file_tickets[0].component
-            component_tickets = [t for t in all_tickets if t.component == component]
-
-            # Update with synced data
-            for synced in file_tickets:
-                for i, t in enumerate(component_tickets):
-                    if t.id == synced.id:
-                        component_tickets[i] = synced
-                        break
-
-            save_tickets(component_tickets, filepath)
-            console.print(f"  [green]✓[/green] Saved {filepath.name}")
-
-    console.print("\n[green]✓ Sync complete![/green]")
-
-
-@sync_app.command("status")
-def sync_status():
-    """Show sync status of all tickets."""
-    tickets = load_tickets(TICKETS_DIR)
-
-    synced = [t for t in tickets if t.linear_id]
-    unsynced = [t for t in tickets if not t.linear_id]
-
-    console.print(f"\n[bold]Sync Status:[/bold]")
-    console.print(f"  [green]Synced:[/green] {len(synced)}")
-    console.print(f"  [yellow]Unsynced:[/yellow] {len(unsynced)}")
-
-    if unsynced:
-        console.print(f"\n[bold]Unsynced tickets:[/bold]")
-        for ticket in unsynced[:10]:
-            console.print(f"  • {ticket.id}: {ticket.title[:50]}")
-        if len(unsynced) > 10:
-            console.print(f"  [dim]...and {len(unsynced) - 10} more[/dim]")
-
-
-@sync_app.command("reconcile")
-def sync_reconcile(
-    fix_labels: bool = typer.Option(False, "--fix-labels", help="Fix labels on matched issues"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Show matches without making changes"),
-):
-    """Match existing Linear issues to YAML tickets and optionally fix labels.
-
-    This command:
-    1. Fetches all issues from Linear
-    2. Matches them to YAML tickets by title
-    3. Links them (saves linear_id to YAML)
-    4. Optionally fixes labels (removes comma-separated, adds individual)
-    """
-    client = get_client()
-    config = LinearConfig.load()
-
-    if not config.team_id:
-        console.print("[red]Error:[/red] No default team configured.")
-        raise typer.Exit(1)
-
-    # Load local tickets
-    tickets = load_tickets(TICKETS_DIR)
-    unsynced = [t for t in tickets if not t.linear_id]
-
-    if not unsynced:
-        console.print("[green]All tickets already synced![/green]")
-        raise typer.Exit(0)
-
-    console.print(f"[bold]Fetching issues from Linear...[/bold]")
-    linear_issues = client.get_team_issues(config.team_id)
-    console.print(f"  Found {len(linear_issues)} issues in Linear")
-
-    # Build title -> issue map (normalize for matching)
-    def normalize(s: str) -> str:
-        return s.lower().strip()
-
-    issue_by_title = {normalize(i["title"]): i for i in linear_issues}
-
-    # Match tickets
-    matches = []
-    unmatched = []
-
-    for ticket in unsynced:
-        normalized_title = normalize(ticket.title)
-        if normalized_title in issue_by_title:
-            matches.append((ticket, issue_by_title[normalized_title]))
-        else:
-            unmatched.append(ticket)
-
-    console.print(f"\n[bold]Match Results:[/bold]")
-    console.print(f"  [green]Matched:[/green] {len(matches)}")
-    console.print(f"  [yellow]Unmatched:[/yellow] {len(unmatched)}")
-
-    if not matches:
-        console.print("\n[yellow]No matches found. Issues may have different titles.[/yellow]")
-        raise typer.Exit(0)
-
-    # Show matches
-    console.print(f"\n[bold]Matched tickets:[/bold]")
-    for ticket, issue in matches[:10]:
-        current_labels = [l["name"] for l in issue.get("labels", {}).get("nodes", [])]
-        console.print(f"  • {ticket.id} ↔ {issue['identifier']}: {ticket.title[:40]}")
-        if fix_labels:
-            console.print(f"    [dim]Current labels: {current_labels}[/dim]")
-            console.print(f"    [dim]New labels: {ticket.labels}[/dim]")
-
-    if len(matches) > 10:
-        console.print(f"  [dim]...and {len(matches) - 10} more[/dim]")
-
-    if dry_run:
-        console.print("\n[yellow]Dry run - no changes made[/yellow]")
-        raise typer.Exit(0)
-
-    # Confirm
-    action = "link and fix labels" if fix_labels else "link"
-    if not typer.confirm(f"\nProceed to {action} {len(matches)} tickets?"):
-        raise typer.Exit(0)
-
-    # Process matches
-    updated_by_component: dict[str, list[Ticket]] = {}
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-    ) as progress:
-        task = progress.add_task(f"Processing {len(matches)} tickets...", total=len(matches))
-
-        for ticket, issue in matches:
-            try:
-                # Link ticket to Linear issue
-                ticket.linear_id = issue["id"]
-                ticket.linear_url = issue["url"]
-
-                # Fix labels if requested
-                if fix_labels and ticket.labels:
-                    # Get correct label IDs
-                    label_ids = [client.get_or_create_label(l, config.team_id) for l in ticket.labels]
-
-                    # Update issue with correct labels
-                    client.update_issue(
-                        issue_id=issue["id"],
-                        labels=ticket.labels,
-                    )
-                    progress.console.print(f"  [green]✓[/green] {issue['identifier']}: linked + labels fixed")
-                else:
-                    progress.console.print(f"  [blue]✓[/blue] {issue['identifier']}: linked")
-
-                # Track for saving
-                comp = ticket.component.value
-                if comp not in updated_by_component:
-                    updated_by_component[comp] = []
-                updated_by_component[comp].append(ticket)
-
-            except Exception as e:
-                progress.console.print(f"  [red]✗[/red] {ticket.id}: {e}")
-
-            progress.advance(task)
-
-    # Save updated tickets
-    console.print("\n[dim]Saving updates to YAML files...[/dim]")
-    for comp, comp_tickets in updated_by_component.items():
-        filepath = TICKETS_DIR / f"{comp}.yaml"
-
-        # Load all tickets for this component
-        all_tickets = load_tickets(TICKETS_DIR)
-        component_tickets = [t for t in all_tickets if t.component.value == comp]
-
-        # Update with linked data
-        for updated in comp_tickets:
-            for i, t in enumerate(component_tickets):
-                if t.id == updated.id:
-                    component_tickets[i] = updated
-                    break
-
-        save_tickets(component_tickets, filepath)
-        console.print(f"  [green]✓[/green] Saved {filepath.name}")
-
-    console.print(f"\n[green]✓ Reconciliation complete![/green]")
-    console.print(f"  Linked: {len(matches)} tickets")
-    if fix_labels:
-        console.print(f"  Labels fixed: {len(matches)} issues")
-
-
-@sync_app.command("cleanup-labels")
-def sync_cleanup_labels(
-    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be deleted"),
-):
-    """Delete comma-separated labels that were created incorrectly.
-
-    Finds labels like "engine, indexing, north-star" and deletes them.
-    """
-    client = get_client()
-
-    console.print("[bold]Fetching labels from Linear...[/bold]")
-    labels = client.get_labels()
-
-    # Find comma-separated labels
-    bad_labels = [l for l in labels if "," in l["name"]]
-
-    if not bad_labels:
-        console.print("[green]No comma-separated labels found![/green]")
-        raise typer.Exit(0)
-
-    console.print(f"\n[bold]Found {len(bad_labels)} bad labels:[/bold]")
-    for label in bad_labels:
-        console.print(f"  • {label['name']}")
-
-    if dry_run:
-        console.print("\n[yellow]Dry run - no changes made[/yellow]")
-        raise typer.Exit(0)
-
-    if not typer.confirm(f"\nDelete {len(bad_labels)} labels?"):
-        raise typer.Exit(0)
-
-    # Delete bad labels
-    deleted = 0
-    for label in bad_labels:
-        if client.delete_label(label["id"]):
-            console.print(f"  [green]✓[/green] Deleted: {label['name']}")
-            deleted += 1
-        else:
-            console.print(f"  [red]✗[/red] Failed: {label['name']}")
-
-    console.print(f"\n[green]✓ Deleted {deleted} labels[/green]")
-
-
-# ============================================================================
-# Import Commands
-# ============================================================================
-
-@app.command("import-csv", deprecated=True)
-def import_csv(
-    csv_file: Path = typer.Argument(..., help="CSV file to import"),
-    component: str = typer.Option(..., "-c", "--component", help="Component for these tickets"),
-):
-    """[DEPRECATED] Import to YAML. Create tickets directly in Linear instead."""
-    import csv
-
-    if not csv_file.exists():
-        console.print(f"[red]File not found:[/red] {csv_file}")
-        raise typer.Exit(1)
-
-    try:
-        comp = Component(component)
-    except ValueError:
-        console.print(f"[red]Invalid component:[/red] {component}")
-        console.print(f"Valid components: {', '.join(c.value for c in Component)}")
-        raise typer.Exit(1)
-
-    tickets = []
-    ticket_num = 1
-
-    with open(csv_file, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            # Parse labels - split by comma and clean up
-            labels_raw = row.get("Labels", "")
-            labels = [l.strip() for l in labels_raw.split(",") if l.strip()]
-
-            # Parse priority (1=Urgent, 2=High, 3=Medium, 4=Low)
-            priority_val = int(row.get("Priority", 3))
-            from .models.ticket import TicketPriority, TicketStatus
-            priority = TicketPriority(priority_val) if priority_val in [1, 2, 3, 4] else TicketPriority.MEDIUM
-
-            # Parse status
-            status_str = row.get("Status", "Backlog")
-            try:
-                status = TicketStatus(status_str)
-            except ValueError:
-                status = TicketStatus.BACKLOG
-
-            # Extract phase from labels if present
-            phase = None
-            phase_labels = [l for l in labels if l.startswith("phase-")]
-            if phase_labels:
-                phase = phase_labels[0]
-                labels = [l for l in labels if l not in phase_labels]
-
-            ticket = Ticket(
-                id=f"{component}-{ticket_num:03d}",
-                title=row["Title"],
-                description=row["Description"],
-                component=comp,
-                priority=priority,
-                status=status,
-                labels=labels,
-                estimate=int(row["Estimate"]) if row.get("Estimate") else None,
-                phase=phase,
-            )
-            tickets.append(ticket)
-            ticket_num += 1
-
-    # Save to YAML
-    TICKETS_DIR.mkdir(parents=True, exist_ok=True)
-    output_file = TICKETS_DIR / f"{component}.yaml"
-    save_tickets(tickets, output_file)
-
-    console.print(f"[green]✓[/green] Imported {len(tickets)} tickets to {output_file}")
+    result = svc_get_ticket(identifier, path=path)
+    response = format_response(result, output_format)
+    console.print(render_cli(response))
 
 
 # ============================================================================
@@ -1038,138 +326,56 @@ app.add_typer(project_app, name="project")
 
 
 @project_app.command("list")
-def project_list():
+def project_list(
+    limit: int = typer.Option(50, "--limit", help="Maximum projects to show"),
+    offset: int = typer.Option(0, "--offset", help="Skip first N projects for pagination"),
+    output_format: str = typer.Option("toon", "--format", "-f", help="Output format (toon|json|text)"),
+):
     """List Linear projects."""
-    client = get_client()
-    projects = client.get_projects()
-
-    if not projects:
-        console.print("[yellow]No projects found.[/yellow]")
-        raise typer.Exit(0)
-
-    table = Table(title="Linear Projects")
-    table.add_column("Name", style="cyan")
-    table.add_column("State", style="yellow")
-    table.add_column("Teams", style="magenta")
-
-    for project in projects:
-        teams = ", ".join(t["name"] for t in project["teams"]["nodes"])
-        table.add_row(project["name"], project["state"], teams)
-
-    console.print(table)
+    result = svc_list_projects(limit=limit, offset=offset)
+    response = format_response(result, output_format)
+    console.print(render_cli(response))
 
 
 @project_app.command("labels")
-def project_labels():
+def project_labels(
+    limit: int = typer.Option(200, "--limit", help="Maximum labels to show"),
+    offset: int = typer.Option(0, "--offset", help="Skip first N labels for pagination"),
+    output_format: str = typer.Option("toon", "--format", "-f", help="Output format (toon|json|text)"),
+):
     """List available labels."""
-    client = get_client()
-    labels = client.get_labels()
-
-    if not labels:
-        console.print("[yellow]No labels found.[/yellow]")
-        raise typer.Exit(0)
-
-    table = Table(title="Linear Labels")
-    table.add_column("Name", style="cyan")
-    table.add_column("Color", style="yellow")
-
-    for label in sorted(labels, key=lambda l: l["name"]):
-        table.add_row(label["name"], label["color"])
-
-    console.print(table)
+    result = svc_list_labels(limit=limit, offset=offset)
+    response = format_response(result, output_format)
+    console.print(render_cli(response))
 
 
 @project_app.command("create")
 def project_create(
     name: str = typer.Argument(..., help="Project name"),
     description: Optional[str] = typer.Option(None, "-d", "--description", help="Project description"),
+    output_format: str = typer.Option("toon", "--format", "-f", help="Output format (toon|json|text)"),
 ):
     """Create a new Linear project."""
-    client = get_client()
-    config = LinearConfig.load()
-
-    if not config.team_id:
-        console.print("[red]Error:[/red] No default team configured.")
-        raise typer.Exit(1)
-
-    try:
-        project = client.create_project(
-            name=name,
-            team_ids=[config.team_id],
-            description=description,
-        )
-        console.print(f"[green]✓[/green] Created project: {project['name']}")
-        console.print(f"  URL: {project['url']}")
-    except Exception as e:
-        console.print(f"[red]Error:[/red] {e}")
-        raise typer.Exit(1)
+    result = svc_create_project(name=name, description=description)
+    response = format_response(result, output_format)
+    console.print(render_cli(response))
 
 
 @project_app.command("add")
 def project_add(
     project_name: str = typer.Argument(..., help="Project name"),
-    component: Optional[str] = typer.Option(None, "-c", "--component", help="Add all tickets from component"),
     tickets: Optional[str] = typer.Option(None, "-t", "--tickets", help="Comma-separated ticket IDs or Linear identifiers"),
-    label: Optional[str] = typer.Option(None, "-l", "--label", help="Add all tickets with this label"),
+    output_format: str = typer.Option("toon", "--format", "-f", help="Output format (toon|json|text)"),
 ):
     """Add tickets to a Linear project."""
-    client = get_client()
-    config = LinearConfig.load()
-
-    if not config.team_id:
-        console.print("[red]Error:[/red] No default team configured.")
-        raise typer.Exit(1)
-
-    # Find project
-    projects = client.get_projects()
-    project = next((p for p in projects if p["name"].lower() == project_name.lower()), None)
-
-    if not project:
-        console.print(f"[red]Error:[/red] Project '{project_name}' not found.")
-        console.print("Available projects:")
-        for p in projects:
-            console.print(f"  • {p['name']}")
-        raise typer.Exit(1)
-
-    # Collect tickets to add
-    local_tickets = load_tickets(TICKETS_DIR)
-    to_add = []
-
-    if component:
-        to_add = [t for t in local_tickets if t.component.value == component and t.linear_id]
-    elif label:
-        to_add = [t for t in local_tickets if label in t.labels and t.linear_id]
-    elif tickets:
-        ticket_ids = [t.strip() for t in tickets.split(",")]
-        for tid in ticket_ids:
-            # Check if it's a Linear identifier (SEM-5) or local ID (engine-001)
-            if "-" in tid and tid.split("-")[0].isupper():
-                # Linear identifier - get ID
-                issue_id = client.get_issue_id_by_identifier(tid)
-                if issue_id:
-                    to_add.append(type('obj', (object,), {'linear_id': issue_id, 'id': tid})())
-            else:
-                # Local ticket ID
-                ticket = next((t for t in local_tickets if t.id == tid), None)
-                if ticket and ticket.linear_id:
-                    to_add.append(ticket)
-
-    if not to_add:
-        console.print("[yellow]No tickets to add.[/yellow]")
+    if not tickets:
+        console.print("[yellow]Provide --tickets with Linear identifiers to add.[/yellow]")
         raise typer.Exit(0)
 
-    console.print(f"Adding {len(to_add)} tickets to project '{project['name']}'...")
-
-    added = 0
-    for ticket in to_add:
-        try:
-            client.add_issue_to_project(ticket.linear_id, project["id"])
-            console.print(f"  [green]✓[/green] {ticket.id}")
-            added += 1
-        except Exception as e:
-            console.print(f"  [red]✗[/red] {ticket.id}: {e}")
-
-    console.print(f"\n[green]✓[/green] Added {added} tickets to '{project['name']}'")
+    ticket_ids = [t.strip() for t in tickets.split(",") if t.strip()]
+    result = svc_add_tickets_to_project(project_name, ticket_ids)
+    response = format_response(result, output_format)
+    console.print(render_cli(response))
 
 
 # ============================================================================
@@ -1184,123 +390,24 @@ app.add_typer(link_app, name="link")
 def link_blocks(
     blocker: str = typer.Argument(..., help="Issue that blocks (e.g., SEM-5 or engine-001)"),
     blocked: str = typer.Argument(..., help="Issue that is blocked (e.g., SEM-6 or adk-001)"),
+    output_format: str = typer.Option("toon", "--format", "-f", help="Output format (toon|json|text)"),
 ):
     """Create a 'blocks' relationship between issues."""
-    client = get_client()
-    local_tickets = load_tickets(TICKETS_DIR)
-
-    def resolve_id(ref: str) -> Optional[str]:
-        """Resolve ticket reference to Linear issue ID."""
-        if "-" in ref and ref.split("-")[0].isupper():
-            return client.get_issue_id_by_identifier(ref)
-        else:
-            ticket = next((t for t in local_tickets if t.id == ref), None)
-            return ticket.linear_id if ticket else None
-
-    blocker_id = resolve_id(blocker)
-    blocked_id = resolve_id(blocked)
-
-    if not blocker_id:
-        console.print(f"[red]Error:[/red] Could not find issue '{blocker}'")
-        raise typer.Exit(1)
-    if not blocked_id:
-        console.print(f"[red]Error:[/red] Could not find issue '{blocked}'")
-        raise typer.Exit(1)
-
-    try:
-        client.create_issue_relation(blocker_id, blocked_id, "blocks")
-        console.print(f"[green]✓[/green] {blocker} blocks {blocked}")
-    except Exception as e:
-        console.print(f"[red]Error:[/red] {e}")
-        raise typer.Exit(1)
+    result = svc_link_blocks(blocker, blocked)
+    response = format_response(result, output_format)
+    console.print(render_cli(response))
 
 
 @link_app.command("related")
 def link_related(
     issue1: str = typer.Argument(..., help="First issue (e.g., SEM-5)"),
     issue2: str = typer.Argument(..., help="Second issue (e.g., SEM-6)"),
+    output_format: str = typer.Option("toon", "--format", "-f", help="Output format (toon|json|text)"),
 ):
     """Create a 'related' relationship between issues."""
-    client = get_client()
-    local_tickets = load_tickets(TICKETS_DIR)
-
-    def resolve_id(ref: str) -> Optional[str]:
-        if "-" in ref and ref.split("-")[0].isupper():
-            return client.get_issue_id_by_identifier(ref)
-        else:
-            ticket = next((t for t in local_tickets if t.id == ref), None)
-            return ticket.linear_id if ticket else None
-
-    id1 = resolve_id(issue1)
-    id2 = resolve_id(issue2)
-
-    if not id1:
-        console.print(f"[red]Error:[/red] Could not find issue '{issue1}'")
-        raise typer.Exit(1)
-    if not id2:
-        console.print(f"[red]Error:[/red] Could not find issue '{issue2}'")
-        raise typer.Exit(1)
-
-    try:
-        client.create_issue_relation(id1, id2, "related")
-        console.print(f"[green]✓[/green] {issue1} ↔ {issue2} (related)")
-    except Exception as e:
-        console.print(f"[red]Error:[/red] {e}")
-        raise typer.Exit(1)
-
-
-@link_app.command("bulk")
-def link_bulk(
-    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be linked"),
-):
-    """Create links from depends_on/blocks fields in YAML tickets."""
-    client = get_client()
-    tickets = load_tickets(TICKETS_DIR)
-
-    # Build ticket ID -> linear_id map
-    id_map = {t.id: t.linear_id for t in tickets if t.linear_id}
-
-    relations = []
-    for ticket in tickets:
-        if not ticket.linear_id:
-            continue
-
-        # depends_on means THIS ticket is blocked by THOSE
-        for dep_id in ticket.depends_on:
-            if dep_id in id_map:
-                relations.append((id_map[dep_id], ticket.linear_id, "blocks", f"{dep_id} blocks {ticket.id}"))
-
-        # blocks means THIS ticket blocks THOSE
-        for block_id in ticket.blocks:
-            if block_id in id_map:
-                relations.append((ticket.linear_id, id_map[block_id], "blocks", f"{ticket.id} blocks {block_id}"))
-
-    if not relations:
-        console.print("[yellow]No relationships defined in YAML tickets.[/yellow]")
-        console.print("[dim]Add 'depends_on' or 'blocks' fields to ticket definitions.[/dim]")
-        raise typer.Exit(0)
-
-    console.print(f"[bold]Found {len(relations)} relationships to create:[/bold]")
-    for _, _, _, desc in relations:
-        console.print(f"  • {desc}")
-
-    if dry_run:
-        console.print("\n[yellow]Dry run - no changes made[/yellow]")
-        raise typer.Exit(0)
-
-    if not typer.confirm(f"\nCreate {len(relations)} relationships?"):
-        raise typer.Exit(0)
-
-    created = 0
-    for blocker_id, blocked_id, rel_type, desc in relations:
-        try:
-            client.create_issue_relation(blocker_id, blocked_id, rel_type)
-            console.print(f"  [green]✓[/green] {desc}")
-            created += 1
-        except Exception as e:
-            console.print(f"  [red]✗[/red] {desc}: {e}")
-
-    console.print(f"\n[green]✓[/green] Created {created} relationships")
+    result = svc_link_related(issue1, issue2)
+    response = format_response(result, output_format)
+    console.print(render_cli(response))
 
 
 # ============================================================================
@@ -1310,196 +417,34 @@ def link_bulk(
 labels_app = typer.Typer(help="Label management commands")
 app.add_typer(labels_app, name="labels")
 
-# Color scheme for label categories
-LABEL_COLOR_SCHEME = {
-    # Components - distinct colors for each
-    "engine": "#E07C24",    # Orange
-    "adk": "#8B5CF6",       # Purple
-    "cli": "#10B981",       # Emerald
-    "pm": "#EC4899",        # Pink
-    "docs": "#6B7280",      # Gray
-    "infra": "#64748B",     # Slate
-
-    # Priority/Importance - warm colors
-    "high-priority": "#EF4444",  # Red
-    "north-star": "#F59E0B",     # Amber
-    "blocker": "#DC2626",        # Dark red
-    "quick-win": "#22C55E",      # Green
-
-    # Work type - blues and teals
-    "performance": "#0EA5E9",    # Sky blue
-    "testing": "#14B8A6",        # Teal
-    "validation": "#06B6D4",     # Cyan
-    "improvement": "#3B82F6",    # Blue
-    "code-quality": "#6366F1",   # Indigo
-
-    # Feature categories - varied
-    "indexing": "#A855F7",       # Violet
-    "git": "#F97316",            # Orange
-    "mcp": "#84CC16",            # Lime
-    "monorepo": "#78716C",       # Stone
-    "models": "#D946EF",         # Fuchsia
-    "config": "#94A3B8",         # Slate light
-    "persistence": "#7C3AED",    # Purple dark
-    "streaming": "#2DD4BF",      # Teal light
-    "caching": "#60A5FA",        # Blue light
-    "cost": "#FBBF24",           # Yellow
-    "offline": "#4ADE80",        # Green light
-
-    # UI/UX
-    "ui": "#FB7185",             # Rose
-    "ux": "#F472B6",             # Pink light
-    "edits": "#818CF8",          # Indigo light
-    "navigation": "#34D399",     # Emerald light
-    "visualization": "#A78BFA",  # Purple light
-    "settings": "#9CA3AF",       # Gray light
-    "error-handling": "#FB923C", # Orange light
-
-    # Phase markers
-    "planned": "#A3E635",        # Lime light
-    "phase-1": "#22D3EE",        # Cyan
-    "phase-2": "#38BDF8",        # Sky
-    "phase-4": "#818CF8",        # Indigo light
-    "phase-5": "#C084FC",        # Purple light
-    "ongoing": "#FCD34D",        # Yellow light
-
-    # Meta
-    "core": "#EF4444",           # Red (important)
-    "distribution": "#F59E0B",   # Amber
-    "prompt-architecture": "#8B5CF6",  # Purple
-    "context": "#0891B2",        # Cyan dark
-    "memory": "#7C3AED",         # Violet dark
-    "orchestration": "#6D28D9",  # Purple dark
-    "verification": "#059669",   # Emerald dark
-    "confidence": "#0D9488",     # Teal dark
-    "types": "#4F46E5",          # Indigo dark
-}
 
 
 @labels_app.command("audit")
 def labels_audit(
     apply: bool = typer.Option(False, "--apply", help="Apply color changes"),
     show_invalid: bool = typer.Option(False, "--show-invalid", help="Show comma-separated labels"),
+    output_format: str = typer.Option("toon", "--format", "-f", help="Output format (toon|json|text)"),
 ):
     """Audit labels and assign colors based on category.
 
     Scans all labels, identifies their category, and assigns appropriate colors.
     Comma-separated labels (improperly imported) are skipped but can be shown.
     """
-    client = get_client()
-
-    console.print("[bold]Fetching labels from Linear...[/bold]")
-    labels = client.get_labels()
-
-    # Separate valid and invalid labels
-    valid_labels = []
-    invalid_labels = []
-
-    for label in labels:
-        if "," in label["name"]:
-            invalid_labels.append(label)
-        else:
-            valid_labels.append(label)
-
-    console.print(f"  Found {len(valid_labels)} valid labels")
-    console.print(f"  Found {len(invalid_labels)} comma-separated labels (skipped)")
-
-    if show_invalid and invalid_labels:
-        console.print("\n[yellow]Comma-separated labels (invalid):[/yellow]")
-        for label in invalid_labels:
-            console.print(f"  • {label['name']}")
-
-    # Analyze and categorize labels
-    table = Table(title="Label Color Audit")
-    table.add_column("Label", style="white")
-    table.add_column("Current Color", style="dim")
-    table.add_column("New Color", style="cyan")
-    table.add_column("Status", style="green")
-
-    changes = []
-
-    for label in sorted(valid_labels, key=lambda l: l["name"].lower()):
-        name = label["name"].lower()
-        current_color = label.get("color", "#default")
-
-        # Find matching color scheme
-        new_color = None
-        for key, color in LABEL_COLOR_SCHEME.items():
-            if name == key or name.startswith(key) or key in name:
-                new_color = color
-                break
-
-        if new_color is None:
-            # Default color for unmatched labels
-            new_color = "#6B7280"  # Gray
-
-        # Check if change is needed
-        needs_change = current_color.lower() != new_color.lower()
-
-        status = "✓ OK" if not needs_change else "→ UPDATE"
-        status_style = "green" if not needs_change else "yellow"
-
-        table.add_row(
-            label["name"],
-            f"[{current_color}]●[/] {current_color}",
-            f"[{new_color}]●[/] {new_color}",
-            f"[{status_style}]{status}[/{status_style}]",
-        )
-
-        if needs_change:
-            changes.append((label["id"], label["name"], new_color))
-
-    console.print(table)
-
-    if not changes:
-        console.print("\n[green]All labels have correct colors![/green]")
-        return
-
-    console.print(f"\n[bold]{len(changes)} labels need color updates[/bold]")
-
-    if not apply:
-        console.print("\n[dim]Run with --apply to update colors[/dim]")
-        return
-
-    # Apply changes
-    if not typer.confirm(f"Apply color changes to {len(changes)} labels?"):
-        raise typer.Exit(0)
-
-    updated = 0
-    for label_id, name, color in changes:
-        if client.update_label(label_id, color=color):
-            console.print(f"  [green]✓[/green] {name} → {color}")
-            updated += 1
-        else:
-            console.print(f"  [red]✗[/red] {name}")
-
-    console.print(f"\n[green]✓ Updated {updated}/{len(changes)} labels[/green]")
+    result = svc_audit_labels(apply=apply, show_invalid=show_invalid)
+    response = format_response(result, output_format)
+    console.print(render_cli(response))
 
 
 @labels_app.command("list")
-def labels_list():
+def labels_list(
+    limit: int = typer.Option(200, "--limit", help="Maximum labels to show"),
+    offset: int = typer.Option(0, "--offset", help="Skip first N labels for pagination"),
+    output_format: str = typer.Option("toon", "--format", "-f", help="Output format (toon|json|text)"),
+):
     """List all labels with their colors."""
-    client = get_client()
-    labels = client.get_labels()
-
-    # Filter out comma-separated
-    valid_labels = [l for l in labels if "," not in l["name"]]
-
-    table = Table(title="Linear Labels")
-    table.add_column("Name", style="cyan")
-    table.add_column("Color", style="yellow")
-    table.add_column("Preview")
-
-    for label in sorted(valid_labels, key=lambda l: l["name"].lower()):
-        color = label.get("color", "#6B7280")
-        table.add_row(
-            label["name"],
-            color,
-            f"[{color}]████[/]",
-        )
-
-    console.print(table)
-    console.print(f"\n[dim]Total: {len(valid_labels)} labels[/dim]")
+    result = svc_list_labels(limit=limit, offset=offset)
+    response = format_response(result, output_format)
+    console.print(render_cli(response))
 
 
 # ============================================================================
@@ -1510,215 +455,22 @@ sprint_app = typer.Typer(help="Sprint planning and management")
 app.add_typer(sprint_app, name="sprint")
 
 
-def _sprint_status_aggregated(base_path: Optional[Path] = None):
-    """Show aggregated sprint status across all .pm/ configs."""
-    target_path = base_path or Path.cwd()
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=True,
-    ) as progress:
-        progress.add_task("Scanning for .pm/ configs...", total=None)
-        dirs = scan_pm_directories(target_path, max_depth=3)
-
-    if not dirs:
-        # Fall back to single context
-        context = resolve_context(target_path)
-        if context.has_team():
-            console.print("[dim]No .pm/ configs found, using inherited context...[/dim]")
-            # Call the regular sprint_status
-            sprint_status(base_path, aggregate=False)
-            return
-        console.print("[yellow]No .pm/ configurations found.[/yellow]")
-        console.print(f"Run: [cyan]semfora-pm init --path <directory>[/cyan]")
-        raise typer.Exit(1)
-
-    # Track unique configs and aggregate issues
-    seen_configs: set[tuple] = set()
-    all_issues: dict[str, dict] = {}
-    projects_info: list[dict] = []
-    errors: list[str] = []
-
-    console.print(f"\n[bold]Aggregating sprint status from {len(dirs)} config(s)...[/bold]\n")
-
-    for dir_info in dirs:
-        config_key = (dir_info.team_id, dir_info.team_name, dir_info.project_id, dir_info.project_name)
-        if config_key in seen_configs:
-            console.print(f"  [dim]Skipping duplicate:[/dim] {dir_info.path.relative_to(target_path)}")
-            continue
-        seen_configs.add(config_key)
-
-        try:
-            client = get_client(dir_info.path)
-            context = resolve_context(dir_info.path)
-
-            team_id = context.team_id
-            if not team_id and context.team_name:
-                team_id = client.get_team_id_by_name(context.team_name)
-
-            if not team_id:
-                continue
-
-            issues = client.get_team_issues(team_id)
-
-            project_name = context.project_name or context.team_name or "Unknown"
-            rel_path = dir_info.path.relative_to(target_path) if dir_info.path != target_path else Path(".")
-            console.print(f"  [green]✓[/green] {rel_path} → {project_name} ({len(issues)} tickets)")
-
-            projects_info.append({
-                "path": str(rel_path),
-                "project": project_name,
-                "count": len(issues),
-            })
-
-            for issue in issues:
-                if issue["identifier"] not in all_issues:
-                    all_issues[issue["identifier"]] = issue
-
-        except Exception as e:
-            rel_path = dir_info.path.relative_to(target_path) if dir_info.path != target_path else Path(".")
-            errors.append(f"{rel_path}: {e}")
-            console.print(f"  [red]✗[/red] {rel_path}: {e}")
-
-    if not all_issues:
-        console.print("\n[yellow]No tickets found across configured projects.[/yellow]")
-        raise typer.Exit(0)
-
-    # Group by state
-    issues_list = list(all_issues.values())
-    todo = [i for i in issues_list if i["state"]["name"] == "Todo"]
-    in_progress = [i for i in issues_list if i["state"]["name"] == "In Progress"]
-    in_review = [i for i in issues_list if i["state"]["name"] == "In Review"]
-
-    console.print(f"\n[bold]Aggregated Sprint Status[/bold] ({len(all_issues)} unique tickets)")
-    console.print(f"[dim]From {len(projects_info)} project(s)[/dim]\n")
-
-    if in_progress:
-        console.print(f"[yellow]In Progress ({len(in_progress)}):[/yellow]")
-        for issue in in_progress:
-            priority = issue.get("priority", 0)
-            priority_icon = "🔴" if priority <= 1 else "🟡" if priority == 2 else "⚪"
-            console.print(f"  {priority_icon} {issue['identifier']}: {issue['title'][:50]}")
-
-    if in_review:
-        console.print(f"\n[blue]In Review ({len(in_review)}):[/blue]")
-        for issue in in_review:
-            console.print(f"  📝 {issue['identifier']}: {issue['title'][:50]}")
-
-    if todo:
-        console.print(f"\n[cyan]Todo ({len(todo)}):[/cyan]")
-        for issue in todo[:10]:
-            priority = issue.get("priority", 0)
-            priority_icon = "🔴" if priority <= 1 else "🟡" if priority == 2 else "⚪"
-            console.print(f"  {priority_icon} {issue['identifier']}: {issue['title'][:50]}")
-        if len(todo) > 10:
-            console.print(f"  [dim]...and {len(todo) - 10} more[/dim]")
-
-    total_active = len(in_progress) + len(in_review) + len(todo)
-    console.print(f"\n[dim]Total active: {total_active} tickets[/dim]")
-
-
 @sprint_app.command("plan")
 def sprint_plan(
     name: str = typer.Argument(..., help="Sprint name (e.g., 'sprint-1')"),
     tickets: str = typer.Option(..., "-t", "--tickets", help="Comma-separated Linear identifiers (e.g., SEM-32,SEM-33)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show plan without making changes"),
     path: Optional[Path] = typer.Option(None, "--path", help="Path for context detection"),
+    output_format: str = typer.Option("toon", "--format", "-f", help="Output format (toon|json|text)"),
 ):
     """Plan a sprint by moving tickets from Backlog to Todo.
 
     Use Linear identifiers (e.g., SEM-32, SEM-33) directly.
     """
-    client = get_client(path)
-
-    # Get team_id from context or legacy config
-    context = resolve_context(path)
-    team_id = context.team_id
-    if not team_id and context.team_name:
-        team_id = client.get_team_id_by_name(context.team_name)
-
-    if not team_id:
-        config = LinearConfig.load()
-        team_id = config.team_id if config else None
-
-    if not team_id:
-        console.print("[red]Error:[/red] No default team configured.")
-        raise typer.Exit(1)
-
-    ticket_ids = [t.strip() for t in tickets.split(",")]
-
-    # Fetch issues directly from Linear
-    all_issues = client.get_team_issues(team_id)
-    issue_by_id = {i["identifier"]: i for i in all_issues}
-
-    # Resolve tickets
-    sprint_issues = []
-    for tid in ticket_ids:
-        if tid in issue_by_id:
-            sprint_issues.append(issue_by_id[tid])
-        else:
-            console.print(f"[yellow]Warning:[/yellow] {tid} not found in Linear")
-
-    if not sprint_issues:
-        console.print("[red]No valid tickets found[/red]")
-        raise typer.Exit(1)
-
-    console.print(f"\n[bold]Sprint: {name}[/bold]")
-    console.print(f"Tickets: {len(sprint_issues)}")
-
-    table = Table(title=f"Sprint Plan: {name}")
-    table.add_column("ID", style="cyan")
-    table.add_column("Title", style="white")
-    table.add_column("Priority", style="yellow")
-    table.add_column("Estimate", style="blue")
-    table.add_column("State", style="magenta")
-
-    total_estimate = 0
-
-    for issue in sprint_issues:
-        estimate = issue.get("estimate") or 0
-        total_estimate += estimate
-        priority = issue.get("priority", 0)
-        priority_str = {0: "None", 1: "Urgent", 2: "High", 3: "Medium", 4: "Low"}.get(priority, str(priority))
-
-        table.add_row(
-            issue["identifier"],
-            issue["title"][:40] + "..." if len(issue["title"]) > 40 else issue["title"],
-            priority_str,
-            str(estimate) if estimate else "—",
-            issue["state"]["name"],
-        )
-
-    console.print(table)
-    console.print(f"\n[dim]Total estimate: {total_estimate} points[/dim]")
-
-    if dry_run:
-        console.print("\n[dim]Dry run - no changes made[/dim]")
-        raise typer.Exit(0)
-
-    # Move tickets to Todo state
-    states = client.get_team_states(team_id)
-    todo_state_id = states.get("Todo")
-
-    if not todo_state_id:
-        console.print("[red]Error:[/red] 'Todo' state not found")
-        raise typer.Exit(1)
-
-    if not typer.confirm(f"\nMove {len(sprint_issues)} tickets to 'Todo' state?"):
-        raise typer.Exit(0)
-
-    moved = 0
-    for issue in sprint_issues:
-        try:
-            client.update_issue(issue["id"], state_id=todo_state_id)
-            console.print(f"  [green]✓[/green] {issue['identifier']}: {issue['title'][:40]}")
-            moved += 1
-        except Exception as e:
-            console.print(f"  [red]✗[/red] {issue['identifier']}: {e}")
-
-    console.print(f"\n[green]✓ Moved {moved} tickets to Todo[/green]")
+    ticket_ids = [t.strip() for t in tickets.split(",") if t.strip()]
+    result = svc_sprint_plan(name=name, tickets=ticket_ids, dry_run=dry_run, path=path)
+    response = format_response(result, output_format)
+    console.print(render_cli(response))
 
 
 @sprint_app.command("suggest")
@@ -1726,99 +478,26 @@ def sprint_suggest(
     points: int = typer.Option(20, "-p", "--points", help="Target story points for sprint"),
     label: Optional[str] = typer.Option(None, "-l", "--label", help="Filter by label"),
     path: Optional[Path] = typer.Option(None, "--path", help="Path for context detection"),
+    limit: int = typer.Option(20, "--limit", help="Maximum suggestions to show"),
+    offset: int = typer.Option(0, "--offset", help="Skip first N suggestions for pagination"),
+    output_format: str = typer.Option("toon", "--format", "-f", help="Output format (toon|json|text)"),
 ):
     """Suggest tickets for next sprint based on priority.
 
     Queries Linear backlog and suggests tickets that fit the point budget.
     """
-    client = get_client(path)
-
-    # Get team_id from context or legacy config
-    context = resolve_context(path)
-    team_id = context.team_id
-    if not team_id and context.team_name:
-        team_id = client.get_team_id_by_name(context.team_name)
-
-    if not team_id:
-        config = LinearConfig.load()
-        team_id = config.team_id if config else None
-
-    if not team_id:
-        console.print("[red]Error:[/red] No default team configured.")
-        raise typer.Exit(1)
-
-    # Fetch issues directly from Linear
-    all_issues = client.get_team_issues(team_id)
-
-    # Filter to backlog tickets
-    backlog = [i for i in all_issues if i["state"]["name"] == "Backlog"]
-
-    if label:
-        backlog = [i for i in backlog if any(l["name"] == label for l in i.get("labels", {}).get("nodes", []))]
-
-    if not backlog:
-        console.print("[yellow]No backlog tickets found[/yellow]")
-        raise typer.Exit(0)
-
-    # Sort by priority (lower is higher priority), then by estimate
-    sorted_issues = sorted(
-        backlog,
-        key=lambda i: (i.get("priority", 4), -(i.get("estimate") or 0))
-    )
-
-    # Greedily select tickets
-    suggested = []
-    current_points = 0
-
-    for issue in sorted_issues:
-        if current_points >= points:
-            break
-        estimate = issue.get("estimate") or 2  # Default estimate
-        if current_points + estimate <= points:
-            suggested.append(issue)
-            current_points += estimate
-
-    # Display suggestions
-    table = Table(title=f"Suggested Sprint ({current_points}/{points} points)")
-    table.add_column("ID", style="cyan")
-    table.add_column("Title", style="white")
-    table.add_column("Priority", style="yellow")
-    table.add_column("Estimate", style="blue")
-    table.add_column("Labels", style="dim")
-
-    for issue in suggested:
-        labels = [l["name"] for l in issue.get("labels", {}).get("nodes", [])][:3]
-        labels_str = ", ".join(labels) if labels else "—"
-        priority = issue.get("priority", 0)
-        priority_str = {0: "None", 1: "Urgent", 2: "High", 3: "Medium", 4: "Low"}.get(priority, str(priority))
-
-        table.add_row(
-            issue["identifier"],
-            issue["title"][:45] + "..." if len(issue["title"]) > 45 else issue["title"],
-            priority_str,
-            str(issue.get("estimate") or "—"),
-            labels_str,
-        )
-
-    console.print(table)
-
-    # Show command to plan this sprint
-    ids = ",".join(i["identifier"] for i in suggested)
-    console.print(f"\n[dim]To plan this sprint, run:[/dim]")
-    console.print(f"  [cyan]semfora-pm sprint plan sprint-X -t \"{ids}\"[/cyan]")
-
-    # Show what was excluded
-    excluded = [i for i in sorted_issues if i not in suggested][:5]
-    if excluded:
-        console.print(f"\n[dim]Next up (over budget):[/dim]")
-        for i in excluded:
-            console.print(f"  • {i['identifier']}: {i['title'][:40]}")
+    result = svc_sprint_suggest(points=points, label=label, limit=limit, offset=offset, path=path)
+    response = format_response(result, output_format)
+    console.print(render_cli(response))
 
 
 @sprint_app.command("status")
 def sprint_status(
     path: Optional[Path] = typer.Option(None, "--path", help="Path for context detection"),
     aggregate: bool = typer.Option(False, "--aggregate", "-a", help="Aggregate across all .pm/ configs in directory tree"),
+    limit: int = typer.Option(20, "--limit", help="Maximum tickets per group"),
+    offset: int = typer.Option(0, "--offset", help="Skip first N tickets per group"),
+    output_format: str = typer.Option("toon", "--format", "-f", help="Output format (toon|json|text)"),
 ):
     """Show current sprint status (tickets in Todo/In Progress).
 
@@ -1826,57 +505,12 @@ def sprint_status(
     across all configured teams/projects (deduping when they share the same project).
     """
     if aggregate:
-        _sprint_status_aggregated(path)
-        return
+        result = svc_sprint_status_aggregated(base_path=path, limit=limit, offset=offset)
+    else:
+        result = svc_sprint_status(path=path, limit=limit, offset=offset)
 
-    client = get_client(path)
-
-    # Get team_id from context or legacy config
-    context = resolve_context(path)
-    team_id = context.team_id
-    if not team_id and context.team_name:
-        team_id = client.get_team_id_by_name(context.team_name)
-
-    if not team_id:
-        config = LinearConfig.load()
-        team_id = config.team_id if config else None
-
-    if not team_id:
-        console.print("[red]Error:[/red] No default team configured.")
-        raise typer.Exit(1)
-
-    issues = client.get_team_issues(team_id)
-
-    # Group by state
-    todo = [i for i in issues if i["state"]["name"] == "Todo"]
-    in_progress = [i for i in issues if i["state"]["name"] == "In Progress"]
-    in_review = [i for i in issues if i["state"]["name"] == "In Review"]
-
-    console.print("\n[bold]Current Sprint Status[/bold]\n")
-
-    if in_progress:
-        console.print(f"[yellow]In Progress ({len(in_progress)}):[/yellow]")
-        for issue in in_progress:
-            priority = issue.get("priority", 0)
-            priority_icon = "🔴" if priority <= 1 else "🟡" if priority == 2 else "⚪"
-            console.print(f"  {priority_icon} {issue['identifier']}: {issue['title'][:50]}")
-
-    if in_review:
-        console.print(f"\n[blue]In Review ({len(in_review)}):[/blue]")
-        for issue in in_review:
-            console.print(f"  📝 {issue['identifier']}: {issue['title'][:50]}")
-
-    if todo:
-        console.print(f"\n[cyan]Todo ({len(todo)}):[/cyan]")
-        for issue in todo[:10]:
-            priority = issue.get("priority", 0)
-            priority_icon = "🔴" if priority <= 1 else "🟡" if priority == 2 else "⚪"
-            console.print(f"  {priority_icon} {issue['identifier']}: {issue['title'][:50]}")
-        if len(todo) > 10:
-            console.print(f"  [dim]...and {len(todo) - 10} more[/dim]")
-
-    total_active = len(in_progress) + len(in_review) + len(todo)
-    console.print(f"\n[dim]Total active: {total_active} tickets[/dim]")
+    response = format_response(result, output_format)
+    console.print(render_cli(response))
 
 
 # ============================================================================
@@ -1887,77 +521,25 @@ def sprint_status(
 def project_describe(
     project_name: str = typer.Argument(..., help="Project name"),
     description: str = typer.Option(..., "-d", "--description", help="Project description"),
+    output_format: str = typer.Option("toon", "--format", "-f", help="Output format (toon|json|text)"),
 ):
     """Update a project's description."""
-    client = get_client()
-
-    projects = client.get_projects()
-    project = next((p for p in projects if p["name"].lower() == project_name.lower()), None)
-
-    if not project:
-        console.print(f"[red]Error:[/red] Project '{project_name}' not found")
-        raise typer.Exit(1)
-
-    try:
-        client.update_project(project["id"], description=description)
-        console.print(f"[green]✓[/green] Updated description for '{project['name']}'")
-    except Exception as e:
-        console.print(f"[red]Error:[/red] {e}")
-        raise typer.Exit(1)
+    result = svc_describe_project(project_name, description)
+    response = format_response(result, output_format)
+    console.print(render_cli(response))
 
 
 @project_app.command("show")
 def project_show(
     project_name: str = typer.Argument(..., help="Project name"),
+    limit: int = typer.Option(50, "--limit", help="Maximum issues to show"),
+    offset: int = typer.Option(0, "--offset", help="Skip first N issues for pagination"),
+    output_format: str = typer.Option("toon", "--format", "-f", help="Output format (toon|json|text)"),
 ):
     """Show project details including tickets."""
-    client = get_client()
-
-    projects = client.get_projects()
-    project = next((p for p in projects if p["name"].lower() == project_name.lower()), None)
-
-    if not project:
-        console.print(f"[red]Error:[/red] Project '{project_name}' not found")
-        raise typer.Exit(1)
-
-    details = client.get_project_details(project["id"])
-
-    if not details:
-        console.print("[red]Error:[/red] Could not fetch project details")
-        raise typer.Exit(1)
-
-    # Display project info
-    panel_content = f"""[bold]{details['name']}[/bold]
-
-[cyan]State:[/cyan] {details['state']}
-[cyan]URL:[/cyan] {details.get('url', '—')}
-[cyan]Target Date:[/cyan] {details.get('targetDate', '—')}
-
-[cyan]Description:[/cyan]
-{details.get('description', 'No description')}
-"""
-    console.print(Panel(panel_content, title="Project Details", border_style="blue"))
-
-    # Show tickets
-    issues = details.get("issues", {}).get("nodes", [])
-    if issues:
-        table = Table(title=f"Issues ({len(issues)})")
-        table.add_column("ID", style="cyan")
-        table.add_column("Title", style="white")
-        table.add_column("State", style="yellow")
-        table.add_column("Priority", style="magenta")
-
-        for issue in issues:
-            priority = issue.get("priority", 0)
-            priority_str = {0: "None", 1: "Urgent", 2: "High", 3: "Medium", 4: "Low"}.get(priority, str(priority))
-            table.add_row(
-                issue["identifier"],
-                issue["title"][:50] + "..." if len(issue["title"]) > 50 else issue["title"],
-                issue["state"]["name"],
-                priority_str,
-            )
-
-        console.print(table)
+    result = svc_show_project(project_name, limit=limit, offset=offset)
+    response = format_response(result, output_format)
+    console.print(render_cli(response))
 
 
 # ============================================================================
@@ -1973,53 +555,17 @@ def tickets_search(
     query: str = typer.Argument(..., help="Search query for ticket titles"),
     limit: int = typer.Option(20, "--limit", help="Maximum results"),
     path: Optional[Path] = typer.Option(None, "--path", help="Path for context detection"),
+    offset: int = typer.Option(0, "--offset", help="Skip first N tickets for pagination"),
+    output_format: str = typer.Option("toon", "--format", "-f", help="Output format (toon|json|text)"),
 ):
     """Search for existing tickets by title.
 
     Use this BEFORE creating tickets to check for duplicates.
     This is especially important for AI agents planning features.
     """
-    client = get_client(path)
-
-    # Get team_id from context or legacy config
-    context = resolve_context(path)
-    team_id = context.team_id
-    if not team_id and context.team_name:
-        team_id = client.get_team_id_by_name(context.team_name)
-
-    if not team_id:
-        config = LinearConfig.load()
-        team_id = config.team_id if config else None
-
-    if not team_id:
-        console.print("[red]Error:[/red] No default team configured.")
-        raise typer.Exit(1)
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=True,
-    ) as progress:
-        progress.add_task(f"Searching for '{query}'...", total=None)
-        issues = client.search_issues(query, team_id, limit)
-
-    if not issues:
-        console.print(f"[green]No existing tickets match '{query}'[/green]")
-        raise typer.Exit(0)
-
-    console.print(f"\n[yellow]Found {len(issues)} potentially similar tickets:[/yellow]\n")
-
-    for issue in issues:
-        state = issue["state"]["name"]
-        state_color = "green" if state == "Done" else "yellow" if state == "In Progress" else "cyan"
-        labels = [l["name"] for l in issue.get("labels", {}).get("nodes", [])][:3]
-        labels_str = f" [{', '.join(labels)}]" if labels else ""
-
-        console.print(f"  [{state_color}]{issue['identifier']}[/]: {issue['title'][:60]}")
-        console.print(f"      State: {state}{labels_str}")
-
-    console.print(f"\n[bold yellow]⚠️  Review these before creating new tickets to avoid duplicates![/bold yellow]")
+    result = svc_search_tickets(query, path=path, limit=limit, offset=offset)
+    response = format_response(result, output_format)
+    console.print(render_cli(response))
 
 
 @tickets_app.command("update")
@@ -2177,13 +723,13 @@ def tickets_update(
 
 @tickets_app.command("create")
 def tickets_create(
-    file: Path = typer.Argument(..., help="YAML/JSON file with ticket definitions"),
+    file: Path = typer.Argument(..., help="JSON file with ticket definitions"),
     skip_duplicates: bool = typer.Option(False, "--skip-duplicates", help="Skip duplicate check"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be created without creating"),
     yes: bool = typer.Option(False, "-y", "--yes", help="Skip confirmation prompts"),
     path: Optional[Path] = typer.Option(None, "--path", help="Path for context detection"),
 ):
-    """Create multiple tickets with relationships from a YAML/JSON file.
+    """Create multiple tickets with relationships from a JSON file.
 
     This command is designed for AI agents planning features. It:
     1. Checks for potential duplicates (unless --skip-duplicates)
@@ -2191,36 +737,38 @@ def tickets_create(
     3. Sets up relationships (blocks, blocked_by, related)
     4. Optionally adds to project/milestone and sprint
 
-    Example YAML format:
+    Example JSON format:
 
     \b
-    project: "My Project"        # Optional: add all to this project
-    milestone: "v1.0"            # Optional: add all to this milestone
-    sprint: true                 # Optional: move all to Todo state
-
-    \b
-    tickets:
-      - id: main-feature         # Temporary ID for references
-        title: "Main feature"
-        description: "Description here"
-        priority: 2              # 1=Urgent, 2=High, 3=Medium, 4=Low
-        estimate: 5
-        labels: [feature, core]
-
-    \b
-      - id: subtask-1
-        title: "Subtask 1"
-        blocked_by: [main-feature]  # References temp ID
-        priority: 3
-        estimate: 3
-
-    \b
-      - id: subtask-2
-        title: "Subtask 2"
-        blocked_by: [subtask-1]
-        related: [main-feature]
+    {
+      "project": "My Project",
+      "milestone": "v1.0",
+      "sprint": true,
+      "tickets": [
+        {
+          "id": "main-feature",
+          "title": "Main feature",
+          "description": "Description here",
+          "priority": 2,
+          "estimate": 5,
+          "labels": ["feature", "core"]
+        },
+        {
+          "id": "subtask-1",
+          "title": "Subtask 1",
+          "blocked_by": ["main-feature"],
+          "priority": 3,
+          "estimate": 3
+        },
+        {
+          "id": "subtask-2",
+          "title": "Subtask 2",
+          "blocked_by": ["subtask-1"],
+          "related": ["main-feature"]
+        }
+      ]
+    }
     """
-    import yaml
     import json
 
     client = get_client(path)
@@ -2246,10 +794,10 @@ def tickets_create(
 
     content = file.read_text()
     try:
-        if file.suffix in [".yaml", ".yml"]:
-            data = yaml.safe_load(content)
-        else:
-            data = json.loads(content)
+        if file.suffix != ".json":
+            console.print("[red]Error:[/red] Only JSON input is supported.")
+            raise typer.Exit(1)
+        data = json.loads(content)
     except Exception as e:
         console.print(f"[red]Error parsing file:[/red] {e}")
         raise typer.Exit(1)

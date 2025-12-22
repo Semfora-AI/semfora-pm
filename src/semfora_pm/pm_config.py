@@ -9,33 +9,30 @@ The .pm/ folder contains project management configuration:
 
 ```
 .pm/
-└── config.yaml          # Main config file
+└── config.json          # Main config file
 ```
 
-### config.yaml Structure
+### config.json Structure
 
-```yaml
-# Project Management Configuration
-provider: linear          # Currently only 'linear' supported
-
-linear:
-  # Team/Organization (one of these required)
-  team_id: "abc123"        # Linear team ID (takes precedence)
-  team_name: "Semfora"     # OR team name for lookup
-
-  # Project (optional)
-  project_id: "xyz789"     # Linear project ID (takes precedence)
-  project_name: "Engine"   # OR project name for lookup
-
-# Optional: use a different API key env var
-auth:
-  api_key_env: "LINEAR_API_KEY_WORK"  # Default: LINEAR_API_KEY
+```json
+{
+  "provider": "linear",
+  "linear": {
+    "team_id": "abc123",
+    "team_name": "Semfora",
+    "project_id": "xyz789",
+    "project_name": "Engine"
+  },
+  "auth": {
+    "api_key_env": "LINEAR_API_KEY_WORK"
+  }
+}
 ```
 
 ### Resolution Order
 
-1. Check for .pm/config.yaml in current directory
-2. Walk up parent directories looking for .pm/config.yaml
+1. Check for .pm/config.json in current directory
+2. Walk up parent directories looking for .pm/config.json
 3. Fall back to ~/.config/semfora-pm/config.json (user default)
 """
 
@@ -45,7 +42,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-import yaml
 from platformdirs import user_cache_dir
 
 # User-level config location
@@ -54,7 +50,7 @@ USER_CONFIG_FILE = USER_CONFIG_DIR / "config.json"
 
 # Directory-level config
 PM_CONFIG_DIR = ".pm"
-PM_CONFIG_FILE = "config.yaml"
+PM_CONFIG_FILE = "config.json"
 
 
 @dataclass
@@ -62,7 +58,7 @@ class PMContext:
     """Resolved PM context for a directory."""
 
     # Source of config
-    config_path: Optional[Path] = None  # Path to .pm/config.yaml or user config
+    config_path: Optional[Path] = None  # Path to .pm/config.json or user config
     config_source: str = "none"  # "directory", "parent", "user", "none"
 
     # Provider
@@ -95,7 +91,7 @@ class PMContext:
 
         Resolution order:
         1. Custom cache_dir from config (if set)
-        2. Same directory as .pm/config.yaml (default)
+        2. Same directory as .pm/config.json (default)
         3. User cache directory fallback
 
         Returns:
@@ -105,7 +101,7 @@ class PMContext:
             return Path(self.cache_dir) / "cache.db"
 
         if self.config_path:
-            # Store next to config.yaml: .pm/cache.db
+            # Store next to config.json: .pm/cache.db
             return self.config_path.parent / "cache.db"
 
         # Fallback to user cache
@@ -126,13 +122,13 @@ class PMDirectoryInfo:
 
 
 def find_pm_config(start_path: Optional[Path] = None) -> Optional[Path]:
-    """Find the nearest .pm/config.yaml by walking up the directory tree.
+    """Find the nearest .pm/config.json by walking up the directory tree.
 
     Args:
         start_path: Directory to start searching from (default: cwd)
 
     Returns:
-        Path to config.yaml if found, None otherwise
+        Path to config.json if found, None otherwise
     """
     if start_path is None:
         start_path = Path.cwd()
@@ -155,9 +151,9 @@ def find_pm_config(start_path: Optional[Path] = None) -> Optional[Path]:
 
 
 def load_pm_config(config_path: Path) -> dict:
-    """Load and parse a .pm/config.yaml file."""
+    """Load and parse a .pm/config.json file."""
     with open(config_path) as f:
-        return yaml.safe_load(f) or {}
+        return json.load(f) or {}
 
 
 def load_user_config() -> Optional[dict]:
@@ -172,7 +168,7 @@ def resolve_context(path: Optional[Path] = None) -> PMContext:
     """Resolve PM context for a path.
 
     Resolution order:
-    1. .pm/config.yaml in the path or its parents
+    1. .pm/config.json in the path or its parents
     2. ~/.config/semfora-pm/config.json (user default)
     3. Environment variables only
 
@@ -184,7 +180,7 @@ def resolve_context(path: Optional[Path] = None) -> PMContext:
     """
     context = PMContext()
 
-    # Step 1: Look for .pm/config.yaml
+    # Step 1: Look for .pm/config.json
     pm_config_path = find_pm_config(path)
 
     if pm_config_path:
@@ -193,7 +189,7 @@ def resolve_context(path: Optional[Path] = None) -> PMContext:
 
         # Determine if it's in the target directory or a parent
         target_dir = Path(path).resolve() if path else Path.cwd().resolve()
-        config_dir = pm_config_path.parent.parent  # .pm/config.yaml -> .pm -> parent
+        config_dir = pm_config_path.parent.parent  # .pm/config.json -> .pm -> parent
 
         if config_dir == target_dir:
             context.config_source = "directory"
@@ -272,7 +268,7 @@ def scan_pm_directories(
         if depth > max_depth:
             return
 
-        # Check for .pm/config.yaml
+        # Check for .pm/config.json
         config_path = path / PM_CONFIG_DIR / PM_CONFIG_FILE
         if config_path.exists():
             try:
@@ -312,7 +308,7 @@ def create_pm_config(
     project_name: Optional[str] = None,
     api_key_env: Optional[str] = None,
 ) -> Path:
-    """Create a .pm/config.yaml file in the specified directory.
+    """Create a .pm/config.json file in the specified directory.
 
     Args:
         path: Directory to create .pm/ in
@@ -348,7 +344,7 @@ def create_pm_config(
 
     config_path = pm_dir / PM_CONFIG_FILE
     with open(config_path, "w") as f:
-        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+        json.dump(config, f, indent=2)
 
     return config_path
 
@@ -358,18 +354,16 @@ def get_context_help_message(context: PMContext) -> str:
     if context.config_source == "none":
         return """No PM configuration found.
 
-To configure PM for this directory, create .pm/config.yaml:
+To configure PM for this directory, create .pm/config.json:
 
-```yaml
-provider: linear
-
-linear:
-  team_name: "Your Team Name"
-  # or team_id: "abc123"
-
-  # Optional: default project
-  project_name: "Your Project"
-  # or project_id: "xyz789"
+```json
+{
+  "provider": "linear",
+  "linear": {
+    "team_name": "Your Team Name",
+    "project_name": "Your Project"
+  }
+}
 ```
 
 Or run: semfora-pm init
