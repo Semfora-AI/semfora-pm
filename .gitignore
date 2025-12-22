@@ -38,6 +38,7 @@ ENV/
 .pm/plans/
 .pm/tickets/
 .pm/dependencies/
+.pm
 
 # User ticket data
 tickets/
